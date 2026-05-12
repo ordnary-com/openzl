@@ -118,6 +118,24 @@ class CsvGreedyTest(_CsvBaseTest):
         self.train_compress_decompress()
 
 
+class CsvSaveAceStateTest(_CsvBaseTest):
+    """
+    Test case for CSV training with --save-ace-state flag.
+
+    Verifies that training with --save-ace-state produces a compressor
+    that correctly compresses and decompresses files.
+    """
+
+    def test_train_compress_decompress(self):
+        execute_train(
+            compressor_info=self.training_compressor_info,
+            uncompressed_dir=input_dir_path(self.input_dir_name),
+            trained_compressor_path=self.compressor_info.compressor_str,
+            extra_args="--save-ace-state",
+        )
+        self.compress_and_decompress_samples()
+
+
 class CsvFullSplitTest(_CsvBaseTest):
     """
     Test case for CSV training and compression using the full-split trainer.
@@ -504,9 +522,19 @@ class ParquetChunkedTest(ParquetTest):
             extra_args="--chunk-size 2M",
         )
 
+        # Compare bytewise rather than by file size: ACE training has
+        # structural non-determinism that can produce two trained compressors
+        # of identical byte count even when their contents differ. The
+        # invariant we actually care about is that the chunk-size parameter
+        # was baked into the serialized compressor — which guarantees the
+        # *bytes* differ, but not the size.
+        with open(default_trained, "rb") as f:
+            default_bytes = f.read()
+        with open(chunked_trained, "rb") as f:
+            chunked_bytes = f.read()
         self.assertNotEqual(
-            os.path.getsize(default_trained),
-            os.path.getsize(chunked_trained),
+            default_bytes,
+            chunked_bytes,
             "Trained compressors should differ when --chunk-size is changed",
         )
 
@@ -910,6 +938,63 @@ class NumericSegmentationTest(unittest.TestCase):
                     info["path"],
                     extra_args="--chunk-size 1M",
                 )
+
+
+class SerialSegmentationTest(unittest.TestCase):
+    """
+    Test case for the serial profile's auto-segmentation via the CLI.
+
+    Generates raw byte data, compresses with the `serial` profile, decompresses,
+    and verifies round-trip correctness with and without --chunk-size.
+    """
+
+    def setUp(self) -> None:
+        import shutil
+        import tempfile
+
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmpdir, True))
+
+        # Generate ~2MB of data so --chunk-size 1M triggers multi-chunk
+        # segmentation (2 chunks).
+        target_bytes = 2 * 1000 * 1000  # 2 MB
+        data = bytes((i % 256) for i in range(target_bytes))
+        self.input_path: str = os.path.join(self.tmpdir, "serial.bin")
+        with open(self.input_path, "wb") as f:
+            f.write(data)
+
+    def _round_trip(self, extra_args: str | None = None) -> None:
+        compressed_path = self.input_path + ".zl"
+        decompressed_path = self.input_path + ".rt"
+
+        compressor_info = CompressorInfo(
+            compressor_str="serial",
+            compressor_type=CompressorType.PROFILE,
+        )
+        execute_compress(
+            file_to_compress_path=self.input_path,
+            compressor_info=compressor_info,
+            compressed_file_path=compressed_path,
+            extra_args=extra_args,
+        )
+        execute_decompress(
+            compressed_file_path=compressed_path,
+            decompressed_file_path=decompressed_path,
+        )
+        from file_utils import file_contents_match
+
+        self.assertTrue(
+            file_contents_match(self.input_path, decompressed_path),
+            f"Round-trip failed for serial profile on {self.input_path}",
+        )
+
+    def test_serial_default_chunk_size(self) -> None:
+        """Default chunk size (16 MiB) on 2MB data → single-chunk segmentation."""
+        self._round_trip()
+
+    def test_serial_with_chunk_size(self) -> None:
+        """--chunk-size 1M on 2MB data forces multi-chunk segmentation."""
+        self._round_trip(extra_args="--chunk-size 1M")
 
 
 class StrictModeTest(_CompressDecompressBaseTest):
