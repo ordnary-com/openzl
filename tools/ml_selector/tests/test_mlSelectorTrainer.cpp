@@ -11,6 +11,7 @@
 #include "tools/ml_selector/ml_selector_trainer.h"
 #include "tools/training/train.h"
 #include "tools/training/train_params.h"
+#include "tools/training/utils/serialized_compressor_internal.h"
 #include "tools/training/utils/utils.h"
 
 namespace openzl::tests {
@@ -286,12 +287,11 @@ class TestMLSelectorTrainer : public testing::Test {
         EXPECT_EQ(cBuffer, scBuffer);
     }
 
-    Compressor deserializeCompressor(
-            std::shared_ptr<const std::string_view>& serializedCompressor)
+    Compressor deserializeCompressor(std::string_view serializedCompressor)
     {
         Compressor mlCompressor;
         mlCompressor.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
-        mlCompressor.deserialize(*serializedCompressor.get());
+        mlCompressor.deserialize(serializedCompressor);
 
         return mlCompressor;
     }
@@ -331,7 +331,7 @@ TEST_F(TestMLSelectorTrainer, MultiClassSelection)
             multiInputs_, trainedCompressor_, trainParams_);
 
     // Deserialize the trained compressor
-    Compressor mlCompressor = deserializeCompressor(serializedCompressor);
+    Compressor mlCompressor = deserializeCompressor(*serializedCompressor);
 
     // Check that the ml selector graph selects the correct successor
     for (size_t i = 0; i < multiSuccessors_.size(); i++) {
@@ -351,7 +351,7 @@ TEST_F(TestMLSelectorTrainer, BinaryClassSelection)
             binaryInputs_, trainedCompressor_, trainParams_);
 
     // Deserialize the trained compressor
-    Compressor mlCompressor = deserializeCompressor(serializedCompressor);
+    Compressor mlCompressor = deserializeCompressor(*serializedCompressor);
 
     // Check that the ml selector graph selects the correct successor
     for (size_t i = 0; i < binarySuccessors_.size(); i++) {
@@ -371,7 +371,7 @@ TEST_F(TestMLSelectorTrainer, BinaryClassRoundTrip)
                     binaryInputs_, trainedCompressor_, trainParams_);
 
     Compressor mlCompressor =
-            deserializeCompressor(serializedBinaryClassCompressors);
+            deserializeCompressor(*serializedBinaryClassCompressors);
 
     // Make sure deserialized data is same as original data
     for (size_t i = 0; i < testData_.size(); i++) {
@@ -388,7 +388,7 @@ TEST_F(TestMLSelectorTrainer, MultiClassRoundTrip)
                     multiInputs_, trainedCompressor_, trainParams_);
 
     Compressor mlCompressor =
-            deserializeCompressor(serializedMultiClassCompressors);
+            deserializeCompressor(*serializedMultiClassCompressors);
 
     // Make sure deserialized data is same as original data
     for (size_t i = 0; i < testData_.size(); i++) {
@@ -400,11 +400,13 @@ TEST_F(TestMLSelectorTrainer, TrainRoundTrip)
 {
     multiSuccessors_ = setUpCompressor(trainedCompressor_, true);
 
-    auto serializedCompressor = openzl::training::train(
-            multiInputs_, trainedCompressor_, trainParams_);
+    auto serializedCompressor =
+            openzl::training::train(
+                    multiInputs_, trainedCompressor_, trainParams_)
+                    .front();
 
     Compressor mlCompressor =
-            deserializeCompressor(serializedCompressor.front());
+            deserializeCompressor(serializedCompressor.serializedCompressor);
 
     testRoundTrip(testData_.front(), mlCompressor);
 }
@@ -483,7 +485,7 @@ TEST_F(TestMLSelectorTrainer, TestAmbiguousData)
             trainData, trainedCompressor_, trainParams_);
 
     // Deserialize the trained compressor
-    Compressor mlCompressor = deserializeCompressor(serializedCompressor);
+    Compressor mlCompressor = deserializeCompressor(*serializedCompressor);
 
     // Check that the ml selector graph selects the correct successor
     std::vector<size_t> sizes          = {};

@@ -9,20 +9,20 @@
 #include "tools/training/clustering/clustering_graph_trainer.h"
 #include "tools/training/graph_mutation/graph_mutation_utils.h"
 #include "tools/training/train.h"
+#include "tools/training/utils/serialized_compressor_internal.h"
 
 using namespace openzl::training::graph_mutation;
 using namespace openzl::tools::logger;
 
 namespace openzl::training {
 
-std::vector<std::shared_ptr<const std::string_view>> train(
+std::vector<TrainedCandidate> train(
         const std::vector<MultiInput>& inputs,
         Compressor& compressor,
         const TrainParams& trainParams)
 {
     auto startTime = std::chrono::steady_clock::now();
-    std::vector<std::shared_ptr<const std::string_view>>
-            serializedTrainedCompressors;
+    std::vector<SerializedCompressorInternal> serializedTrainedCompressors;
     if (!trainParams.compressorGenFunc) {
         throw Exception("Compressor generator function is not set.");
     }
@@ -45,8 +45,9 @@ std::vector<std::shared_ptr<const std::string_view>> train(
     }
 
     if (graph_mutation::hasTargetGraph(compressor, ML_SELECTOR_GRAPH_NAME)) {
-        serializedTrainedCompressors = { trainMLSelectorGraph(
-                inputs, compressor, trainParams) };
+        serializedTrainedCompressors.clear();
+        serializedTrainedCompressors.push_back(
+                trainMLSelectorGraph(inputs, compressor, trainParams));
     }
 
     if (serializedTrainedCompressors.empty()) {
@@ -68,6 +69,14 @@ std::vector<std::shared_ptr<const std::string_view>> train(
                     Compressor::convertSerializedToJson(
                             *serializedTrainedCompressors[0]))
                     .c_str());
-    return serializedTrainedCompressors;
+
+    std::vector<TrainedCandidate> retval;
+    retval.reserve(serializedTrainedCompressors.size());
+    for (auto& trainedCompressor : serializedTrainedCompressors) {
+        retval.emplace_back(
+                TrainedCandidate{ .serializedCompressor =
+                                          std::string(*trainedCompressor) });
+    }
+    return retval;
 }
 } // namespace openzl::training
