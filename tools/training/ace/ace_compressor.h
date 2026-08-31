@@ -8,6 +8,7 @@
 #include "openzl/cpp/poly/StringView.hpp"
 #include "openzl/openzl.hpp"
 #include "tools/training/ace/ace_utils.h"
+#include "tools/training/utils/benchmark.h"
 #include "tools/training/utils/utils.h"
 
 namespace openzl {
@@ -18,6 +19,8 @@ struct ACENode {
     poly::optional<NodeParameters> params;
     Type inputType;
     std::vector<Type> outputTypes;
+    /// Minimum format version this node requires; 0 means unconstrained.
+    unsigned minFormatVersion{ 0 };
 };
 
 struct ACEGraph {
@@ -67,62 +70,7 @@ struct ACEGraphCompressor {
     GraphID build(Compressor& compressor) const;
 };
 
-struct ACECompressionResult {
-    size_t originalSize{ 0 };
-    size_t compressedSize{ 0 };
-    std::chrono::nanoseconds compressionTime{ 0 };
-    std::chrono::nanoseconds decompressionTime{ 0 };
-
-    float compressionRatio() const
-    {
-        return (float)originalSize / compressedSize;
-    }
-
-    float compressionSpeedMBps() const
-    {
-        return ((float)originalSize * 1000.0) / compressionTime.count();
-    }
-
-    float decompressionSpeedMBps() const
-    {
-        return ((float)originalSize * 1000.0) / decompressionTime.count();
-    }
-
-    std::vector<float> asFloatVector() const
-    {
-        return {
-            compressionRatio(),
-            compressionSpeedMBps(),
-            decompressionSpeedMBps(),
-        };
-    }
-
-    bool operator<(const ACECompressionResult& other) const
-    {
-        return std::tie(compressedSize, compressionTime, decompressionTime)
-                < std::tie(
-                        other.compressedSize,
-                        other.compressionTime,
-                        other.decompressionTime);
-    }
-
-    ACECompressionResult& operator+=(const ACECompressionResult& other)
-    {
-        originalSize += other.originalSize;
-        compressedSize += other.compressedSize;
-        compressionTime += other.compressionTime;
-        decompressionTime += other.decompressionTime;
-        return *this;
-    }
-};
-
-poly::optional<ACECompressionResult> benchmark(
-        const Compressor& compressor,
-        poly::span<const Input> inputs);
-
-poly::optional<ACECompressionResult> benchmark(
-        const Compressor& compressor,
-        poly::span<const poly::span<const Input>> inputs);
+using ACECompressionResult = CompressionResult;
 
 /// A compressor built by ACE that can either be a ACENodeCompressor or
 /// ACEGraphCompressor.
@@ -271,9 +219,11 @@ class ACECompressor {
     }
 
     /// @returns The benchmark result of the compressor on the @p inputs or
-    /// poly::nullopt if the compressor fails to compress.
+    /// poly::nullopt if the compressor fails to compress (including when it
+    /// requires a newer format version than @p formatVersion).
     poly::optional<ACECompressionResult> benchmark(
-            poly::span<const Input> inputs) const;
+            poly::span<const Input> inputs,
+            uint32_t formatVersion) const;
 
    private:
     uint64_t computeHash() const;

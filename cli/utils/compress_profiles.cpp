@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cli/utils/compress_profiles.h"
+#include "cli/utils/profile_graphs.h"
 #include "cli/utils/util.h"
 
 #include <string.h>
@@ -8,7 +9,6 @@
 #include <limits>
 
 #include "openzl/codecs/zl_conversion.h"
-#include "openzl/codecs/zl_lz.h"
 #include "openzl/codecs/zl_mlselector.h"
 #include "openzl/codecs/zl_sddl2.h"
 #include "openzl/codecs/zl_segmenters.h"
@@ -171,20 +171,13 @@ static std::string makeProfileDescription(bool isSigned, size_t bitWidth)
 static ZL_GraphID
 buildIntProfile(ZL_Compressor* comp, void* opaque, const ProfileArgs& args)
 {
-    auto* d          = static_cast<IntProfileData*>(opaque);
-    size_t bitWidth  = d->eltByteWidth * 8;
-    ZL_GraphID graph = ZL_GRAPH_FIELD_LZ;
-    if (d->isSigned) {
-        graph = ZL_Compressor_registerStaticGraph_fromNode1o(
-                comp, ZL_NODE_ZIGZAG, graph);
+    if (!opaque) {
+        return ZL_GRAPH_ILLEGAL;
     }
-    graph = ZL_Compressor_buildACEGraphWithDefault(comp, graph);
-    graph = ZL_Compressor_registerStaticGraph_fromNode1o(
-            comp, ZL_Node_interpretAsLE(bitWidth), graph);
+    const auto& d = *static_cast<const IntProfileData*>(opaque);
     size_t chunkSize =
             args.chunkSize().value_or(ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
-    return ZL_Compressor_buildNumFromSerialSegmenter(
-            comp, d->eltByteWidth, chunkSize, graph);
+    return profiles::buildIntGraph(comp, d.eltByteWidth, d.isSigned, chunkSize);
 }
 
 static void addIntProfile(
@@ -320,8 +313,20 @@ compressProfiles()
                 kSerialName,
                 "Serial data (aka raw bytes)",
                 [](ZL_Compressor* compressor, void*, const ProfileArgs& args) {
-                    ZL_GraphID inner = ZL_Compressor_buildACEGraphWithDefault(
-                            compressor, ZL_GRAPH_LZ);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return profiles::buildSerialGraph(compressor, chunkSize);
+                },
+                nullptr,
+                true);
+
+        const std::string kLz = "lz";
+        mp[kLz]               = std::make_shared<CompressProfile>(
+                kLz,
+                "Trainable LZ compressor",
+                [](ZL_Compressor* compressor, void*, const ProfileArgs& args) {
+                    CompressorRef c(compressor);
+                    ZL_GraphID inner = graphs::Lz{}(c);
                     size_t chunkSize = args.chunkSize().value_or(
                             ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
                     return ZL_Compressor_buildSerialSegmenter(
@@ -329,6 +334,17 @@ compressProfiles()
                 },
                 nullptr,
                 true);
+
+        std::string kZstd = "zstd";
+        mp[kZstd]         = std::make_shared<CompressProfile>(
+                kZstd,
+                "Use this profile to train a Zstd dict",
+                [](ZL_Compressor* compressor, void*, const ProfileArgs&) {
+                    return ZL_RES_value(
+                            ZL_Compressor_buildTrainableZstdGraph(compressor));
+                },
+                nullptr,
+                false);
 
         std::string kPytorchName = "pytorch";
         mp[kPytorchName]         = std::make_shared<CompressProfile>(
@@ -427,8 +443,17 @@ compressProfiles()
                                 "The Simple Data Description Language v2 profile requires a data description file. Pass a path to the description file with --profile-arg.");
                     }
                     auto description = tools::io::InputFile(it->second);
-                    auto compiled    = sddl2::Compiler{}.compile(
-                            description.contents(), description.name());
+                    // Map the CLI log level onto the compiler's scale: INFO
+                    // (the default) keeps the compiler quiet, and each -v above
+                    // INFO raises compiler verbosity by one.
+                    auto compiled =
+                            sddl2::Compiler{
+                                sddl2::Compiler::Options{}.with_verbosity(
+                                        args.verbosityLevel() - 3)
+                            }
+                                    .compile(
+                                            description.contents(),
+                                            description.name());
                     auto bytecode   = sddl2::Assembler{}.assemble(compiled);
                     auto clustering = ZS2_createGraph_genericClustering(comp);
                     auto graph      = ZL_Compressor_registerSDDL2Graph_advanced(

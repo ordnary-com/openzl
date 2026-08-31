@@ -86,14 +86,27 @@ struct CompressArgs : public GlobalArgs, public ProfileArgs {
                 0,
                 false,
                 "Disable anti-inflation guard (do not replace expanding chunks with STORE).");
+        parser.addCommandFlag(
+                cmd(),
+                kDictBundle,
+                'D',
+                true,
+                "Path to a fat dict bundle (.zd) file to load for compression.");
     }
 
     explicit CompressArgs(const arg::ParsedArgs& parsed)
             : GlobalArgs(parsed), ProfileArgs(parsed)
     {
         // Create the compressor
+        std::string bundleData;
+        auto bundlePath = parsed.cmdFlag(cmd(), kDictBundle);
+        if (bundlePath) {
+            tools::io::InputFile bundleInput(bundlePath.value());
+            bundleData = bundleInput.contents();
+        }
+        setVerbosityLevel(verbosity);
         setCompressor(createCompressorFromArgs(
-                *this, parsed.cmdFlag(cmd(), kCompressor)));
+                *this, parsed.cmdFlag(cmd(), kCompressor), bundleData));
 
         // Get the input and output files
         auto inputPath = parsed.cmdPositional(cmd(), kInput);
@@ -164,6 +177,7 @@ struct CompressArgs : public GlobalArgs, public ProfileArgs {
     inline static const std::string kStoreOnExpansion = "store-on-expansion";
     inline static const std::string kNoStoreOnExpansion =
             "no-store-on-expansion";
+    inline static const std::string kDictBundle = "dict-bundle";
 };
 
 } // namespace openzl::cli

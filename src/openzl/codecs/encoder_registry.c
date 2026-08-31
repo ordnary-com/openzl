@@ -26,11 +26,13 @@
 #include "openzl/codecs/mux_lengths/encode_mux_lengths_binding.h"
 #include "openzl/codecs/parse_int/encode_parse_int_binding.h"
 #include "openzl/codecs/partition/encode_partition_binding.h"
+#include "openzl/codecs/pivco_huffman/encode_pivco_binding.h"
 #include "openzl/codecs/prefix/encode_prefix_binding.h"
 #include "openzl/codecs/quantize/encode_quantize_binding.h"
 #include "openzl/codecs/range_pack/encode_range_pack_binding.h"
 #include "openzl/codecs/rolz/encode_rolz_binding.h"
 #include "openzl/codecs/sentinel/encode_sentinel_binding.h"
+#include "openzl/codecs/sparse_num/encode_sparse_num_binding.h"
 #include "openzl/codecs/splitByStruct/encode_splitByStruct_binding.h"
 #include "openzl/codecs/splitN/encode_splitN_binding.h"
 #include "openzl/codecs/splitN/encode_split_byrange_binding.h"
@@ -40,6 +42,7 @@
 #include "openzl/codecs/zstd/encode_zstd_binding.h"
 #include "openzl/common/assertion.h"
 #include "openzl/compress/private_nodes.h"
+#include "openzl/dict/dict_constants.h"
 #include "openzl/shared/utils.h"
 #include "openzl/zl_version.h"
 
@@ -71,6 +74,7 @@
     .minFormatVersion = (_minFormatVersion),                        \
     .maxFormatVersion = (_maxFormatVersion),                        \
     .minLibraryVersion = (_reqLibVersion),                          \
+    .maybeDictIndex = ZL_DICT_INDEX_NONE,                           \
     .transformDesc = {                                              \
         .publicDesc = _macro(_strid),                               \
     },                                                              \
@@ -132,8 +136,10 @@ const CNode ER_standardNodes[STANDARD_ENCODERS_NB] = {
     REGISTER_TRANSFORM(ZL_StandardNodeID_split_byrange, ZL_StandardTransformID_splitn_num, 24, 200, EI_SPLIT_BYRANGE),
     REGISTER_TRANSFORM(ZL_StandardNodeID_sentinel_byte, ZL_StandardTransformID_sentinel, 24, 200, EI_SENTINEL_BYTE),
     REGISTER_TRANSFORM(ZL_StandardNodeID_sentinel_num, ZL_StandardTransformID_sentinel, 24, 200, EI_SENTINEL),
-    REGISTER_TRANSFORM(ZL_StandardNodeID_lz, ZL_StandardTransformID_lz, 24, 200, EI_LZ),
+    REGISTER_TRANSFORM(ZL_StandardNodeID_lz, ZL_StandardTransformID_lz, 24, 204, EI_LZ),
     REGISTER_TRANSFORM(ZL_StandardNodeID_mux_lengths, ZL_StandardTransformID_mux_lengths, 24, 200, EI_MUX_LENGTHS),
+    REGISTER_TRANSFORM(ZL_StandardNodeID_sparse_num, ZL_StandardTransformID_sparse_num, 26, 202, EI_SPARSE_NUM),
+    REGISTER_TRANSFORM(ZL_StandardNodeID_sparse_num_auto, ZL_StandardTransformID_sparse_num, 26, 202, EI_SPARSE_NUM_AUTO),
 
     // Private Nodes
     REGISTER_TRANSFORM(ZL_PrivateStandardNodeID_set_string_lens,           ZL_StandardTransformID_convert_serial_string, 10, 200, EI_SETSTRINGLENS),
@@ -156,6 +162,7 @@ const CNode ER_standardNodes[STANDARD_ENCODERS_NB] = {
     REGISTER_TRANSFORM(ZL_PrivateStandardNodeID_dedup_num_trusted, ZL_StandardTransformID_dedup_num, 16, 200, EI_DEDUP_NUM_TRUSTED),
     REGISTER_TRANSFORM(ZL_PrivateStandardNodeID_lz4, ZL_StandardTransformID_lz4, 23, 200, EI_LZ4),
     REGISTER_TRANSFORM(ZL_PrivateStandardNodeID_bitSplit, ZL_StandardTransformID_bitSplit, 24, 200, EI_BITSPLIT),
+    REGISTER_TRANSFORM(ZL_PrivateStandardNodeID_pivco_huffman, ZL_StandardTransformID_pivco_huffman, 27, 203, EI_PIVCO_HUFFMAN),
 
     // Deprecated Nodes
     REGISTER_DEPRECATED_TRANSFORM(ZL_PrivateStandardNodeID_rolz_deprecated, ZL_StandardTransformID_rolz, 3, 12, 200, EI_ROLZ),
