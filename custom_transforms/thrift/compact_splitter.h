@@ -60,6 +60,12 @@ class DCompactParser : public DBaseParser<DCompactParser> {
     template <typename Value>
     void writeValue(Value val);
 
+    template <typename Value>
+    void writeValueUnchecked(Value val);
+
+    template <typename Value>
+    static constexpr size_t maxWriteBytes();
+
     inline static constexpr uint64_t zigzagEncode(int64_t n);
     inline static constexpr uint32_t zigzagEncode(int32_t n);
     inline static constexpr uint8_t unparseBool(uint8_t byte);
@@ -167,6 +173,36 @@ ZL_FORCE_INLINE_ATTR void DCompactParser::writeValue(Value val)
     }
 }
 
+template <typename Value>
+ZL_FORCE_INLINE_ATTR void DCompactParser::writeValueUnchecked(Value val)
+{
+    assert(ws_.width() == 1);
+    static_assert(std::is_arithmetic_v<Value>);
+    if constexpr (sizeof(Value) == 1 || std::is_floating_point_v<Value>) {
+        ws_.writeValueUnchecked(folly::Endian::big(val));
+    } else {
+        assert(sizeof(Value) > 1 && std::is_integral_v<Value>);
+        if constexpr (std::is_signed_v<Value>) {
+            ws_.writeVarintUnchecked(zigzagEncode(val));
+        } else {
+            ws_.writeVarintUnchecked(val);
+        }
+    }
+}
+
+template <typename Value>
+constexpr size_t DCompactParser::maxWriteBytes()
+{
+    static_assert(std::is_arithmetic_v<Value>);
+    if constexpr (sizeof(Value) == 1 || std::is_floating_point_v<Value>) {
+        return sizeof(Value);
+    } else if constexpr (sizeof(Value) > 4) {
+        return ZL_VARINT_FAST_OVERWRITE_64;
+    } else {
+        return ZL_VARINT_FAST_OVERWRITE_32;
+    }
+}
+
 ZL_FORCE_INLINE_ATTR ListInfo
 CompactParser::parseListHeader(const CompactParser::PT::Iterator& current)
 {
@@ -193,7 +229,7 @@ CompactParser::parseListHeader(const CompactParser::PT::Iterator& current)
     const TType elemType     = parseType(typeNibble, TypeParse::kForCollection);
     writeType(elemType);
 
-    debug("List header: size {}, type {}", size, elemType);
+    debug("List header: size {}, type {}", size, fmt::underlying(elemType));
     return { .size = size, .elemType = elemType };
 }
 
@@ -215,7 +251,7 @@ DCompactParser::unparseListHeader(const DCompactParser::PT::Iterator& current)
     debug("List header: size {}, type {} ({})",
           size,
           thriftTypeToString(elemType),
-          elemType);
+          fmt::underlying(elemType));
     return { .size = size, .elemType = elemType };
 }
 
@@ -242,9 +278,9 @@ CompactParser::parseMapHeader(const CompactParser::PT::Iterator& current)
     debug("Map header: size {}, keyType {} ({}), valueType {} ({})",
           size,
           thriftTypeToString(keyType),
-          keyType,
+          fmt::underlying(keyType),
           thriftTypeToString(valueType),
-          valueType);
+          fmt::underlying(valueType));
     return { .size = size, .keyType = keyType, .valueType = valueType };
 }
 
@@ -271,8 +307,8 @@ DCompactParser::unparseMapHeader(const DCompactParser::PT::Iterator& current)
 
     debug("Map header: size {}, keyType {}, valueType {}",
           size,
-          keyType,
-          valueType);
+          fmt::underlying(keyType),
+          fmt::underlying(valueType));
     return { .size = size, .keyType = keyType, .valueType = valueType };
 }
 
@@ -334,7 +370,7 @@ CompactParser::parseFieldHeader(
         writeValue(field_it, val);
     }
 
-    debug("Field header: type {}, id {}", type, rawId);
+    debug("Field header: type {}, id {}", fmt::underlying(type), rawId);
     return field_it;
 }
 
@@ -377,7 +413,7 @@ DCompactParser::unparseFieldHeader(
         writeValue<int16_t>(rawId);
     }
 
-    debug("Field header: type {}, id {}", type, rawId);
+    debug("Field header: type {}, id {}", fmt::underlying(type), rawId);
     return field_it;
 }
 
@@ -389,7 +425,7 @@ void CompactParser::advance(const CompactParser::PT::Iterator& current)
           rs_.pos(),
           current.pathStr(),
           thriftTypeToString(type),
-          type,
+          fmt::underlying(type),
           (int32_t)id);
     switch (type) {
         case TType::T_BOOL:
@@ -482,7 +518,7 @@ bool DCompactParser::advanceIfTrivial(
           ws_.nbytes(),
           current.pathStr(),
           thriftTypeToString(type),
-          type,
+          fmt::underlying(type),
           (int32_t)id);
     switch (type) {
         case TType::T_BOOL:
@@ -561,7 +597,7 @@ void DCompactParser::advance(const DCompactParser::PT::Iterator& current)
           ws_.nbytes(),
           current.pathStr(),
           thriftTypeToString(type),
-          type,
+          fmt::underlying(type),
           (int32_t)id);
     switch (type) {
         case TType::T_MAP: {

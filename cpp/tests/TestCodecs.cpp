@@ -77,12 +77,15 @@ TEST_F(TestCodecs, lzParameters)
                                     .hashLog1         = 15,
                                     .hashLog2         = 17,
                                     .hashLength       = 5,
+                                    .searchLog        = 3,
                             },
-                    .literalsGraph        = graphs::Store::graph,
-                    .offsetsGraph         = graphs::Store::graph,
-                    .muxedBytesGraph      = graphs::Store::graph,
-                    .overflowLengthsGraph = graphs::Store::graph,
-                    .muxLengthsGraph      = muxLengthsGraph,
+                    .literalsGraph          = graphs::Store::graph,
+                    .offsetsGraph           = graphs::Store::graph,
+                    .muxedBytesGraph        = graphs::Store::graph,
+                    .overflowLengthsGraph   = graphs::Store::graph,
+                    .muxLengthsGraph        = muxLengthsGraph,
+                    .minGainForEntropyBytes = 42,
+                    .minGainForEntropyPct   = 43,
             });
 
     const auto graphParameters = lz.parameters();
@@ -98,11 +101,14 @@ TEST_F(TestCodecs, lzParameters)
         { ZL_LzParam_hashLog1, 15 },
         { ZL_LzParam_hashLog2, 17 },
         { ZL_LzParam_hashLength, 5 },
+        { ZL_LzParam_searchLog, 3 },
         { ZL_LzParam_literalsGraphIdx, 0 },
         { ZL_LzParam_offsetsGraphIdx, 1 },
         { ZL_LzParam_muxedBytesGraphIdx, 2 },
         { ZL_LzParam_overflowLengthsGraphIdx, 3 },
         { ZL_LzParam_muxLengthsGraphIdx, 4 },
+        { ZL_LzParam_minGainForEntropyBytes, 42 },
+        { ZL_LzParam_minGainForEntropyPct, 43 },
     };
     EXPECT_EQ(
             collectIntParams(*graphParameters->localParams), expectedIntParams);
@@ -126,10 +132,11 @@ TEST_F(TestCodecs, lzNodeParameters)
                     .compressionLevel = 3,
                     .acceleration     = 4,
                     .windowLog        = 17,
-                    .strategy         = ZL_LzStrategy_doubleFast,
+                    .strategy         = ZL_LzStrategy_lazy2,
                     .hashLog1         = 14,
                     .hashLog2         = 16,
                     .hashLength       = 6,
+                    .searchLog        = 4,
             });
 
     const auto nodeParameters = lz.parameters();
@@ -140,10 +147,11 @@ TEST_F(TestCodecs, lzNodeParameters)
         { ZL_LzParam_compressionLevel, 3 },
         { ZL_LzParam_acceleration, 4 },
         { ZL_LzParam_windowLog, 17 },
-        { ZL_LzParam_strategy, ZL_LzStrategy_doubleFast },
+        { ZL_LzParam_strategy, ZL_LzStrategy_lazy2 },
         { ZL_LzParam_hashLog1, 14 },
         { ZL_LzParam_hashLog2, 16 },
         { ZL_LzParam_hashLength, 6 },
+        { ZL_LzParam_searchLog, 4 },
     };
     EXPECT_EQ(
             collectIntParams(*nodeParameters->localParams), expectedIntParams);

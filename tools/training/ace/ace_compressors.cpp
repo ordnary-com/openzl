@@ -11,61 +11,16 @@
 namespace openzl {
 namespace training {
 namespace {
-std::string getName(GraphID graph)
-{
-    Compressor compressor;
-    auto name = ZL_Compressor_Graph_getName(compressor.get(), graph);
-    if (name == nullptr) {
-        throw Exception("Unknown graph!");
-    }
-    return name;
-}
-
-std::string getName(NodeID node)
-{
-    Compressor compressor;
-    auto name = ZL_Compressor_Node_getName(compressor.get(), node);
-    if (name == nullptr) {
-        throw Exception("Unknown node!");
-    }
-    return name;
-}
-
 template <typename NodeT>
 ACENode buildNode(const NodeT& node)
 {
-    assert(NodeT::metadata.inputs.size() == 1);
-    std::vector<Type> outputTypes;
-    outputTypes.reserve(
-            NodeT::metadata.singletonOutputs.size()
-            + NodeT::metadata.variableOutputs.size());
-    for (const auto& meta : NodeT::metadata.singletonOutputs) {
-        outputTypes.push_back(meta.type);
-    }
-    for (const auto& meta : NodeT::metadata.variableOutputs) {
-        outputTypes.push_back(meta.type);
-    }
-    Compressor compressor;
-    const unsigned minFormatVersion =
-            ZL_Compressor_Node_getMinVersion(compressor.get(), NodeT::node);
-    return ACENode{
-        .name             = getName(NodeT::node),
-        .params           = node.parameters(),
-        .inputType        = NodeT::metadata.inputs[0].type,
-        .outputTypes      = std::move(outputTypes),
-        .minFormatVersion = minFormatVersion,
-    };
+    return ACENode(node);
 }
 
 template <typename GraphT>
 ACEGraph buildGraph(const GraphT& graph)
 {
-    static_assert(GraphT::metadata.inputs.size() == 1);
-    return ACEGraph{
-        .name          = getName(GraphT::graph),
-        .params        = graph.parameters(),
-        .inputTypeMask = GraphT::metadata.inputs[0].typeMask,
-    };
+    return ACEGraph(graph);
 }
 
 std::vector<ACENode> makeAllNodes()
@@ -118,6 +73,7 @@ std::vector<ACEGraph> makeAllGraphs()
 {
     std::vector<ACEGraph> g;
     g.push_back(buildGraph(graphs::Compress{}));
+    g.push_back(buildGraph(graphs::TransformerNumeric{}));
     g.push_back(buildGraph(graphs::Entropy{}));
     g.push_back(buildGraph(graphs::Bitpack{}));
     g.push_back(buildGraph(graphs::Constant{}));
@@ -126,6 +82,12 @@ std::vector<ACEGraph> makeAllGraphs()
     }
     for (int level = -5; level < 10; ++level) {
         g.push_back(buildGraph(graphs::Zstd{ level }));
+    }
+    for (int level : { 1, 3, 6, 9, 12 }) {
+        g.push_back(buildGraph(graphs::Lz4{ level }));
+    }
+    for (int level : { -3, 1, 3, 6, 9 }) {
+        g.push_back(buildGraph(graphs::Lz{ level }));
     }
     g.push_back(buildGraph(graphs::Flatpack{}));
     g.push_back(buildGraph(graphs::Store{}));
@@ -141,9 +103,12 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         compressors.emplace_back(graph);
     }
 
+    ACECompressor transformer(buildGraph(graphs::TransformerNumeric{}));
     ACECompressor fieldLz(buildGraph(graphs::FieldLz{}));
     ACECompressor zstd(buildGraph(graphs::Zstd{}));
     ACECompressor transpose(buildNode(nodes::TransposeSplit{}), { zstd });
+    ACECompressor lz4(buildGraph(graphs::Lz4{}));
+    ACECompressor lz(buildGraph(graphs::Lz{}));
     ACECompressor deltaFieldLz(buildNode(nodes::DeltaInt{}), { fieldLz });
     ACECompressor deltaTranspose(buildNode(nodes::DeltaInt{}), { transpose });
     ACECompressor tokenizeSortedFieldLz(
@@ -177,9 +142,12 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
     ACECompressor quantizeLengths(
             buildNode(nodes::QuantizeOffsets{}), { fse, store });
     std::vector<ACECompressor> prebuilt = {
+        transformer,
         fieldLz,
         zstd,
         transpose,
+        lz4,
+        lz,
         deltaFieldLz,
         deltaTranspose,
         tokenizeSortedFieldLz,
@@ -212,10 +180,14 @@ std::vector<ACECompressor> makePrebuiltStructCompressors()
     ACECompressor transpose(buildNode(nodes::TransposeSplit{}), { zstd });
     ACECompressor tokenizeFieldLz(
             buildNode(nodes::TokenizeStruct{}), { transpose, fieldLz });
+    ACECompressor lz4(buildGraph(graphs::Lz4{}));
+    ACECompressor lz(buildGraph(graphs::Lz{}));
 
     compressors.push_back(zstd);
     compressors.push_back(transpose);
     compressors.push_back(tokenizeFieldLz);
+    compressors.push_back(lz4);
+    compressors.push_back(lz);
 
     for (const auto& compressor : makePrebuiltNumericCompressors()) {
         compressors.push_back(ACECompressor(

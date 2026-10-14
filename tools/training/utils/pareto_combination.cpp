@@ -19,10 +19,10 @@ namespace training {
 using namespace openzl::tools::logger;
 
 namespace {
+const size_t kDefaultNumFinalParetoCandidates = 100;
 
 // TODO: Make these hyperparameters training args
 const size_t kNumIntermediateFrontierCandidates = 1000;
-const size_t kNumFinalParetoCandidates          = 100;
 
 /**
  * Merges 2 vectors of candidates getting all combinations. Then filters out
@@ -88,7 +88,7 @@ std::vector<std::vector<poly::optional<CompressionResult>>> joinBenchmarks(
                 if (error == nullptr) {
                     error = std::current_exception();
                 }
-                graphResults.push_back(poly::nullopt);
+                graphResults.emplace_back(poly::nullopt);
             }
         }
         results.push_back(std::move(graphResults));
@@ -111,6 +111,7 @@ std::vector<std::vector<CandidateSelection>> getBackendGraphSelections(
         const std::function<Compressor()>& makeCompressor,
         const MergedParetoFrontier::BackendGraphMutationsMap& candidates,
         poly::span<const MultiInput> compressionInputs,
+        const std::shared_ptr<const std::string>& dictBundleData,
         ThreadPool& threadPool)
 {
     // Collect the input streams to each backend graph. Sorted so that the
@@ -139,10 +140,14 @@ std::vector<std::vector<CandidateSelection>> getBackendGraphSelections(
         std::vector<BenchmarkFuture> graphFutures;
         graphFutures.reserve(candidates.at(backendGraph).size());
         for (const auto& mutation : candidates.at(backendGraph)) {
-            graphFutures.push_back(
-                    threadPool.run([&makeCompressor, &mutation, &inputs] {
+            graphFutures.push_back(threadPool.run(
+                    [&makeCompressor, &mutation, &inputs, dictBundleData] {
                         return mutation->benchmarkBackendGraph(
-                                makeCompressor, inputs);
+                                makeCompressor,
+                                inputs,
+                                dictBundleData
+                                        ? poly::string_view(*dictBundleData)
+                                        : poly::string_view{});
                     }));
         }
         futures.push_back(std::move(graphFutures));
@@ -186,21 +191,27 @@ MergedParetoFrontier::MergedParetoFrontier(
         std::function<Compressor()> makeCompressor,
         BackendGraphMutationsMap candidates,
         poly::span<const MultiInput> inputs,
-        poly::optional<uint32_t> threads)
+        const TrainParams& params)
         : makeCompressor_(std::move(makeCompressor)),
           candidates_(std::move(candidates))
 {
     ThreadPool threadPool(
             std::max<size_t>(
                     1,
-                    threads.value_or(std::thread::hardware_concurrency() / 2)));
+                    params.threads.value_or(
+                            std::thread::hardware_concurrency() / 2)));
 
     auto selections = getBackendGraphSelections(
-            makeCompressor_, candidates_, inputs, threadPool);
+            makeCompressor_,
+            candidates_,
+            inputs,
+            params.dictBundleData,
+            threadPool);
 
-    auto frontier = combineCandidates(selections, threadPool);
-    paretoFrontier_ =
-            pruneCandidates(std::move(frontier), kNumFinalParetoCandidates);
+    auto frontier   = combineCandidates(selections, threadPool);
+    paretoFrontier_ = pruneCandidates(
+            std::move(frontier),
+            params.maxNumCandidates.value_or(kDefaultNumFinalParetoCandidates));
     std::sort(paretoFrontier_.begin(), paretoFrontier_.end());
     if (paretoFrontier_.empty()) {
         paretoFrontier_.emplace_back();

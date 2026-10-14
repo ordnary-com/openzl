@@ -1,6 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <numeric>
 #include <random>
 #include <string>
@@ -10,8 +12,10 @@
 
 #include "openzl/cpp/CCtx.hpp"
 #include "openzl/cpp/codecs/ACE.hpp"
+#include "openzl/zl_compressor.h"
 #include "tools/training/ace/ace.h"
 #include "tools/training/ace/ace_compressor.h"
+#include "tools/training/ace/ace_compressors.h"
 #include "tools/training/ace/ace_mutate.h"
 #include "tools/training/ace/ace_sampling.h"
 #include "tools/training/ace/automated_compressor_explorer.h"
@@ -47,6 +51,59 @@ std::pair<std::string, std::vector<uint32_t>> tripleDeltaStringData()
         lengths.push_back(uint32_t(s.size()));
     }
     return { std::move(content), std::move(lengths) };
+}
+
+/// Trains @p numGraphs ACE graphs, one per field of a struct input, each graph
+/// seeing @p recordsPerGraph records, under a total budget of @p maxTimeSecs.
+/// @returns How long the whole training call took.
+std::chrono::milliseconds
+timeAceTraining(size_t numGraphs, size_t recordsPerGraph, size_t maxTimeSecs)
+{
+    std::vector<uint64_t> data(numGraphs * recordsPerGraph);
+    std::iota(data.begin(), data.end(), 0);
+    undelta(data);
+
+    std::vector<Input> inputsVec;
+    inputsVec.push_back(
+            Input::refSerial(data.data(), data.size() * sizeof(data[0])));
+    std::vector<MultiInput> multiInputs;
+    multiInputs.emplace_back(std::move(inputsVec));
+
+    auto compressorGenFunc = [](poly::string_view serialized,
+                                poly::string_view bundle = "") {
+        auto compressor = std::make_unique<Compressor>();
+        compressor->deserialize(serialized, bundle);
+        return compressor;
+    };
+
+    Compressor compressor;
+    std::vector<size_t> fieldSizes(numGraphs, sizeof(uint64_t));
+    std::vector<ZL_GraphID> fieldGraphs;
+    fieldGraphs.reserve(numGraphs);
+    for (size_t i = 0; i < numGraphs; ++i) {
+        fieldGraphs.push_back(graphs::ACE()(compressor));
+    }
+    compressor.selectStartingGraph(ZL_Compressor_registerSplitByStructGraph(
+            compressor.get(),
+            fieldSizes.data(),
+            fieldGraphs.data(),
+            fieldSizes.size()));
+    compressor.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+
+    TrainParams trainParams = {
+        .compressorGenFunc = compressorGenFunc,
+        .threads           = 1,
+        .maxTimeSecs       = maxTimeSecs,
+    };
+
+    ACETrainer trainer;
+    const auto start = std::chrono::steady_clock::now();
+    auto results =
+            trainer.train(multiInputs, compressor.serialize(), trainParams);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+    EXPECT_FALSE(results.empty());
+    return elapsed;
 }
 } // namespace
 
@@ -96,6 +153,26 @@ TEST_F(ACETest, FormatVersionMustBeSet)
             Exception);
 }
 
+TEST_F(ACETest, BenchmarkUsesCompressionLevel)
+{
+    const auto data       = tripleDeltaData();
+    const auto input      = Input::refNumeric(poly::span<const uint64_t>(data));
+    const auto compressor = buildCompressGenericCompressor();
+
+    const auto defaultResult =
+            compressor.benchmark({ &input, 1 }, ZL_MAX_FORMAT_VERSION, 0);
+    const auto highLevelResult =
+            compressor.benchmark({ &input, 1 }, ZL_MAX_FORMAT_VERSION, 7);
+
+    ASSERT_TRUE(defaultResult.has_value());
+    ASSERT_TRUE(highLevelResult.has_value());
+    EXPECT_NE(defaultResult->compressedSize, highLevelResult->compressedSize);
+
+    params.compressionLevel = 7;
+    AutomatedCompressorExplorer ace({ &input, 1 }, params);
+    EXPECT_EQ(ace.compressionLevel(), 7);
+}
+
 TEST_F(ACETest, CompressesAtAllFormatVersions)
 {
     // A compressor trained for a specific, non-default format version must
@@ -113,7 +190,8 @@ TEST_F(ACETest, CompressesAtAllFormatVersions)
 
         EXPECT_EQ(ace->formatVersion(), version);
 
-        auto result = solution.benchmark(ace->inputs(), version);
+        auto result = solution.benchmark(
+                ace->inputs(), version, ace->compressionLevel());
         ASSERT_TRUE(result.has_value());
         ASSERT_GT(result->compressedSize, 0u);
     }
@@ -171,7 +249,8 @@ TEST_F(ACETest, TripleDeltaNumeric)
     auto data     = tripleDeltaData();
     auto input    = Input::refNumeric(poly::span<const uint64_t>(data));
     auto solution = runOnInput(input);
-    auto result   = solution.benchmark(ace->inputs(), ZL_MAX_FORMAT_VERSION);
+    auto result   = solution.benchmark(
+            ace->inputs(), ZL_MAX_FORMAT_VERSION, ace->compressionLevel());
     ASSERT_TRUE(result.has_value());
     ASSERT_LE(result->compressedSize, 90);
 }
@@ -181,7 +260,8 @@ TEST_F(ACETest, TripleDeltaSerial)
     auto data  = tripleDeltaData();
     auto input = Input::refSerial(data.data(), data.size() * sizeof(data[0]));
     auto solution = runOnInput(input);
-    auto result   = solution.benchmark(ace->inputs(), ZL_MAX_FORMAT_VERSION);
+    auto result   = solution.benchmark(
+            ace->inputs(), ZL_MAX_FORMAT_VERSION, ace->compressionLevel());
     ASSERT_TRUE(result.has_value());
     ASSERT_LE(result->compressedSize, 90);
 }
@@ -191,7 +271,8 @@ TEST_F(ACETest, TripleDeltaStruct)
     auto data     = tripleDeltaData();
     auto input    = Input::refStruct(poly::span<const uint64_t>(data));
     auto solution = runOnInput(input);
-    auto result   = solution.benchmark(ace->inputs(), ZL_MAX_FORMAT_VERSION);
+    auto result   = solution.benchmark(
+            ace->inputs(), ZL_MAX_FORMAT_VERSION, ace->compressionLevel());
     ASSERT_TRUE(result.has_value());
     ASSERT_LE(result->compressedSize, 90);
 }
@@ -201,7 +282,8 @@ TEST_F(ACETest, TripleDeltaString)
     auto [content, lengths] = tripleDeltaStringData();
     auto input              = Input::refString(content, lengths);
     auto solution           = runOnInput(input);
-    auto result = solution.benchmark(ace->inputs(), ZL_MAX_FORMAT_VERSION);
+    auto result             = solution.benchmark(
+            ace->inputs(), ZL_MAX_FORMAT_VERSION, ace->compressionLevel());
     ASSERT_TRUE(result.has_value());
     ASSERT_LE(result->compressedSize, 110);
 }
@@ -211,7 +293,8 @@ TEST_F(ACETest, savePopulation)
     auto data  = tripleDeltaData();
     auto input = Input::refSerial(data.data(), data.size() * sizeof(data[0]));
     auto solution = runOnInput(input);
-    auto result   = solution.benchmark(ace->inputs(), ZL_MAX_FORMAT_VERSION);
+    auto result   = solution.benchmark(
+            ace->inputs(), ZL_MAX_FORMAT_VERSION, ace->compressionLevel());
     ASSERT_TRUE(result.has_value());
     ASSERT_LE(result->compressedSize, 90);
     auto snapshot = ace->savePopulation();
@@ -224,10 +307,10 @@ TEST_F(ACETest, savePopulation)
     // Initial population doesn't have a good solution
     {
         auto solution2 = ace2.solution()[0].first;
-        auto result2 =
-                solution2.benchmark(ace->inputs(), ZL_MAX_FORMAT_VERSION);
+        auto result2   = solution2.benchmark(
+                ace->inputs(), ZL_MAX_FORMAT_VERSION, ace->compressionLevel());
         ASSERT_TRUE(result2.has_value());
-        ASSERT_GT(result2->compressedSize, 90);
+        ASSERT_GT(result2->compressedSize, 74);
         ASSERT_NE(solution, solution2);
     }
 
@@ -235,10 +318,10 @@ TEST_F(ACETest, savePopulation)
     ace2.loadPopulation(snapshot);
     {
         auto solution2 = ace2.solution()[0].first;
-        auto result2 =
-                solution2.benchmark(ace->inputs(), ZL_MAX_FORMAT_VERSION);
+        auto result2   = solution2.benchmark(
+                ace->inputs(), ZL_MAX_FORMAT_VERSION, ace->compressionLevel());
         ASSERT_TRUE(result2.has_value());
-        ASSERT_LE(result2->compressedSize, 90);
+        ASSERT_LE(result2->compressedSize, 74);
     }
     // NOTE: The exact smallest solution may not be preserved due to benchmark
     // instability, since it might not be Pareto-optimal in the new benchmark.
@@ -333,6 +416,32 @@ TEST(ACETrainerTest, NoSaveAceStateProducesSmallerCompressor)
             << "Compressed data sizes should be identical since both come from "
                "the same training run: "
             << compressedWith.size() << " vs " << compressedWithout.size();
+}
+
+TEST(ACETrainerTest, MaxTimeSecsIsSharedAcrossAceGraphs)
+{
+    constexpr size_t kNumGraphs   = 8;
+    constexpr size_t kMaxTimeSecs = 2;
+    // Enough records that a single generation outlasts the budget, so an
+    // unshared budget costs a full generation per graph.
+    constexpr size_t kRecordsPerGraph = 16384;
+
+    // The budget only stops training between generations, and one generation
+    // can outrun it on a slow machine, so a wall-clock bound would flake.
+    // Compare against a one-graph run over the same records per graph instead:
+    // shared, the cost stays near the one-graph cost; unshared, it multiplies
+    // by the graph count.
+    const auto oneGraph = timeAceTraining(1, kRecordsPerGraph, kMaxTimeSecs);
+    const auto allGraphs =
+            timeAceTraining(kNumGraphs, kRecordsPerGraph, kMaxTimeSecs);
+
+    // Half the cost of running all 8 graphs which each individually receive
+    // the full time budget.
+    const auto budget = oneGraph * int64_t(kNumGraphs) / 2;
+    EXPECT_LT(allGraphs, budget)
+            << "ACE training over " << kNumGraphs << " graphs took "
+            << allGraphs.count() << "ms, against " << oneGraph.count()
+            << "ms for one graph, for a budget of " << kMaxTimeSecs << "s";
 }
 
 } // namespace tests

@@ -125,6 +125,7 @@ nav:
   - Tools:
     - Overview: tools/index.md
     - Trace Visualizer: tools/trace
+    - Compression Playground: tools/playground
   - Blog:
     - blog/index.md
 
@@ -191,6 +192,8 @@ markdown_extensions:
           format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.arithmatex:
       generic: true
+  - pymdownx.tabbed:
+      alternate_style: true
 
 plugins:
   - mkdocs-openzl:
@@ -201,6 +204,7 @@ plugins:
       authors: true
       post_url_date_format: yyyy-MM-dd
       post_url_format: "{date}-{slug}"
+      post_excerpt: required
   - mkdocstrings:
       default_handler: zstd
       handlers:

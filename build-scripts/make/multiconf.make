@@ -7,25 +7,25 @@
 # Provides V=1 / VERBOSE=1 support. V=2 is used for debugging purposes.
 # Complement target clean: delete objects and binaries created by this script
 
+# Source files are discovered in the current directory and below.
 # Requires:
-# - C_SRCDIRS, CXX_SRCDIRS, ASM_SRCDIRS defined
-#   OR
-#   C_SRCS, CXX_SRCS and ASM_SRCS variables defined
-#   *and* vpath set to find all source files
-#   OR
-#   C_OBJS, CXX_OBJS and ASM_OBJS variables defined
-#   *and* vpath set to find all source files
-# - directory `cachedObjs/` available to cache object files.
-#   alternatively: set CACHE_ROOT to some different value.
+# - directory `.cache/multiconf/` available to cache object files.
+#   alternatively: set MCM_CACHE_ROOT to some different value.
 # Optional:
+# - MCM_EXCLUDE_DIRS: directories to skip, besides hidden ones and MCM_CACHE_ROOT,
+#   as paths from the current directory or `find -path` patterns (e.g. docs */experimental)
+# - C_SRCDIRS, CXX_SRCDIRS, ASM_SRCDIRS: directories to add, e.g. excluded ones
+# - C_SRCS, CPP_SRCS, CC_SRCS and ASM_SRCS (or C_OBJS, CPP_OBJS, CC_OBJS and ASM_OBJS)
+#   replace the discovered files
 # - HASH can be set to a different custom hash program.
 
 # *_program*: generates a recipe for a target that will be built in a cache directory.
-# The cache directory is automatically derived from CACHE_ROOT and list of flags and compilers.
-# *_shared_o* variants are optional optimization variants, that share the same objects across multiple targets.
-# However, as a consequence, all these objects must have exactly the same list of flags,
-# which in practice means that there must be no target-level modification (like: target: CFLAGS += someFlag).
-# If unsure, only use the standard variants, c_program and cxx_program.
+# The cache directory is automatically derived from MCM_CACHE_ROOT and the compilers and flags
+# in effect for the target, including target-level modifications (like: target: CFLAGS += someFlag).
+# Targets with identical flags share their object files.
+# *_shared_o* variants are kept for compatibility: they are identical to the standard variants.
+#
+# Note: enables .SECONDEXPANSION, so a `$$` in a prerequisite list is expanded twice.
 
 # All *_program* macro functions take up to 4 argument:
 # - The name of the target
@@ -39,7 +39,11 @@ VERBOSE ?= $(V)
 $(VERBOSE).SILENT:
 
 # Directory where object files will be built
-CACHE_ROOT ?= cachedObjs
+MCM_CACHE_ROOT ?= .cache/multiconf
+# CACHE_ROOT, the former name, is ignored: an environment variable of that name would make `clean` delete its directory
+ifneq (,$(filter file command line override,$(origin CACHE_ROOT)))
+  $(warning CACHE_ROOT is ignored, set MCM_CACHE_ROOT instead)
+endif
 
 # --------------------------------------------------------------------------------------------
 
@@ -62,13 +66,37 @@ else ifeq ($(UNAME), OpenBSD)
 endif
 HASH ?= md5sum
 
+# Layout: $(MCM_CACHE_ROOT)/<global flags>/<target flags>/ holds object files, and each binary
+# is linked in a subdirectory keyed on its object list and link flags, so that changing
+# them relinks without recompiling.
+
+# Flags that affect object files. Expanded in the context of each target,
+# so that target-level modifications are included.
+MCM_COMPILE_KEY = $(CC) $(CXX) $(CPPFLAGS) $(CFLAGS) $(CXXFLAGS)
+
 HAVE_HASH := $(shell echo 1 | $(HASH) > /dev/null && echo 1 || echo 0)
 ifeq ($(HAVE_HASH),0)
   $(info warning : could not find HASH ($(HASH)), required to differentiate builds using different flags)
-  HASH_FUNC = generic/$(1)
+  MCM_GLOBAL_DIR := generic
+  mcm_subdirs = $(1)/bin
 else
-  HASH_FUNC = $(firstword $(shell echo $(2) | $(HASH) ))
+  MCM_GLOBAL_DIR := $(firstword $(shell echo $(MCM_COMPILE_KEY) | $(HASH)))
+  # mcm_subdirs - <hash of $(2)>/<hash of $(3)>, in a single shell call.
+  # md5sum follows each hash with `-`, or `*-` in binary mode (Windows).
+  mcm_subdirs = $(call mcm_join_dirs,$(filter-out - *-,$(shell echo $(2) | $(HASH); echo $(3) | $(HASH))))
+  mcm_join_dirs = $(word 1,$(1))/$(word 2,$(1))
 endif
+
+# The target-level flags of a target are only visible when make processes it,
+# hence its cache path is computed during secondary expansion of its prerequisites.
+.SECONDEXPANSION:
+
+# mcm_cache_path - Cache path of binary $(1), from the flags in effect for $(1)
+mcm_cache_path = $(MCM_CACHE_ROOT)/$(MCM_GLOBAL_DIR)/$(call mcm_subdirs,$(1),$(MCM_COMPILE_KEY) $(MCM_XHASH_$(1)),$(MCM_OBJS_$(1)) $(MCM_LINK_KEY_$(1)))/$(1)
+
+# mcm_link_objs - Object files $(2) of a binary whose cache path stem is $(1):
+# they are in the parent directory
+mcm_link_objs = $(addprefix $(MCM_CACHE_ROOT)/$(dir $(1)),$(2))
 
 STRIP ?= strip
 MKDIR ?= mkdir
@@ -84,62 +112,70 @@ LN ?= ln
 # to delete it. So we work around that by marking it "precious". Solution found
 # here:
 # http://ismail.badawi.io/blog/2017/03/28/automatic-directory-creation-in-make/
-.PRECIOUS: $(CACHE_ROOT)/%/.
-$(CACHE_ROOT)/%/. :
+.PRECIOUS: $(MCM_CACHE_ROOT)/%/.
+$(MCM_CACHE_ROOT)/%/. :
 	$(MKDIR) -p $@
 
 
 define addTargetAsmObject  # targetName, addlDeps
 $$(if $$(filter 2,$$(V)),$$(info $$(call $(0),$(1),$(2))))
 
-.PRECIOUS: $$(CACHE_ROOT)/%/$(1)
-$$(CACHE_ROOT)/%/$(1) : $(1:.o=.S) $(2) | $$(CACHE_ROOT)/%/$(dir $(1))/.
+.PRECIOUS: $$(MCM_CACHE_ROOT)/%/$(1)
+$$(MCM_CACHE_ROOT)/%/$(1) : $(1:.o=.S) $(2) | $$(MCM_CACHE_ROOT)/%/$(dir $(1))/. $$$$(MCM_ODEPS_$(1))
 	@echo AS $$@
-	$$(CC) $$(CPPFLAGS) $$(CXXFLAGS) $$(DEPFLAGS) $$(CACHE_ROOT)/$$*/$(1:.o=.d) -c $$< -o $$@
+	$$(CC) $$(CPPFLAGS) $$(CXXFLAGS) $$(DEPFLAGS) $$(MCM_CACHE_ROOT)/$$*/$(1:.o=.d) -c $$< -o $$@
 
 endef # addTargetAsmObject
 
 define addTargetCObject  # targetName, addlDeps
 $$(if $$(filter 2,$$(V)),$$(info $$(call $(0),$(1),$(2)))) #debug print
 
-.PRECIOUS: $$(CACHE_ROOT)/%/$(1)
-$$(CACHE_ROOT)/%/$(1) : $(1:.o=.c) $(2) | $$(CACHE_ROOT)/%/$(dir $(1))/.
+.PRECIOUS: $$(MCM_CACHE_ROOT)/%/$(1)
+$$(MCM_CACHE_ROOT)/%/$(1) : $(1:.o=.c) $(2) | $$(MCM_CACHE_ROOT)/%/$(dir $(1))/. $$$$(MCM_ODEPS_$(1))
 	@echo CC $$@
-	$$(CC) $$(CPPFLAGS) $$(CFLAGS) $$(DEPFLAGS) $$(CACHE_ROOT)/$$*/$(1:.o=.d) -c $$< -o $$@
+	$$(CC) $$(CPPFLAGS) $$(CFLAGS) $$(DEPFLAGS) $$(MCM_CACHE_ROOT)/$$*/$(1:.o=.d) -c $$< -o $$@
 
 endef # addTargetCObject
 
 define addTargetCxxObject  # targetName, suffix, addlDeps
 $$(if $$(filter 2,$$(V)),$$(info $$(call $(0),$(1),$(2),$(3))))
 
-.PRECIOUS: $$(CACHE_ROOT)/%/$(1)
-$$(CACHE_ROOT)/%/$(1) : $(1:.o=.$(2)) $(3) | $$(CACHE_ROOT)/%/$(dir $(1))/.
+.PRECIOUS: $$(MCM_CACHE_ROOT)/%/$(1)
+$$(MCM_CACHE_ROOT)/%/$(1) : $(1:.o=.$(2)) $(3) | $$(MCM_CACHE_ROOT)/%/$(dir $(1))/. $$$$(MCM_ODEPS_$(1))
 	@echo CXX $$@
-	$$(CXX) $$(CPPFLAGS) $$(CXXFLAGS) $$(DEPFLAGS) $$(CACHE_ROOT)/$$*/$(1:.o=.d) -c $$< -o $$@
+	$$(CXX) $$(CPPFLAGS) $$(CXXFLAGS) $$(DEPFLAGS) $$(MCM_CACHE_ROOT)/$$*/$(1:.o=.d) -c $$< -o $$@
 
 endef # addTargetCxxObject
 
-# Discover source files and directories
-C_SRCDIRS += .
+# mcm_order_deps - Make objects $(1) wait for files $(2) before compiling, without
+# recompiling when they change: e.g. headers of dependencies fetched on demand.
+mcm_order_deps = $(foreach o,$(1),$(eval MCM_ODEPS_$(o) += $(2)))
+
+# Discover source files: in the current directory and below, except in hidden directories,
+# $(MCM_CACHE_ROOT) and MCM_EXCLUDE_DIRS. Files are listed rather than directories, so that
+# large trees without sources (e.g. node_modules) only cost their traversal.
+MCM_SRCS := $(patsubst ./%,%,$(shell find . -name '.?*' -prune \
+	$(foreach d,$(patsubst %/,%,$(MCM_CACHE_ROOT) $(MCM_EXCLUDE_DIRS)),-o -path './$(d)' -prune) \
+	-o ! -type d \( -name '*.c' -o -name '*.cpp' -o -name '*.cc' -o -name '*.S' \) -print))
+
+# Directories added by C_SRCDIRS, CXX_SRCDIRS and ASM_SRCDIRS
 vpath %.c $(C_SRCDIRS)
-CXX_SRCDIRS += .
 vpath %.cpp $(CXX_SRCDIRS)
 vpath %.cc $(CXX_SRCDIRS)
-ASM_SRCDIRS += .
 vpath %.S $(ASM_SRCDIRS)
 
-# If C_SRCDIRS, CXX_SRCDIRS and ASM_SRCDIRS are not defined, use C_SRCS, CXX_SRCS and ASM_SRCS
-C_SRCS   ?= $(foreach dir,$(C_SRCDIRS),$(wildcard $(dir)/*.c))
-CPP_SRCS ?= $(foreach dir,$(CXX_SRCDIRS),$(wildcard $(dir)/*.cpp))
-CC_SRCS  ?= $(foreach dir,$(CXX_SRCDIRS),$(wildcard $(dir)/*.cc))
+# If C_SRCS, CPP_SRCS, CC_SRCS and ASM_SRCS are not defined, use the discovered and added files
+C_SRCS   ?= $(sort $(filter %.c,$(MCM_SRCS)) $(foreach dir,$(C_SRCDIRS),$(wildcard $(dir)/*.c)))
+CPP_SRCS ?= $(sort $(filter %.cpp,$(MCM_SRCS)) $(foreach dir,$(CXX_SRCDIRS),$(wildcard $(dir)/*.cpp)))
+CC_SRCS  ?= $(sort $(filter %.cc,$(MCM_SRCS)) $(foreach dir,$(CXX_SRCDIRS),$(wildcard $(dir)/*.cc)))
 CXX_SRCS ?= $(CPP_SRCS) $(CC_SRCS)
-ASM_SRCS ?= $(foreach dir,$(ASM_SRCDIRS),$(wildcard $(dir)/*.S))
+ASM_SRCS ?= $(sort $(filter %.S,$(MCM_SRCS)) $(foreach dir,$(ASM_SRCDIRS),$(wildcard $(dir)/*.S)))
 
 # If C_SRCS, CXX_SRCS and ASM_SRCS are not defined, use C_OBJS, CXX_OBJS and ASM_OBJS
 C_OBJS   ?= $(patsubst %.c,%.o,$(C_SRCS))
 CPP_OBJS ?= $(patsubst %.cpp,%.o,$(CPP_SRCS))
 CC_OBJS  ?= $(patsubst %.cc,%.o,$(CC_SRCS))
-CXX_OBJS ?= $(CPP_OBJS) $(CC_OBJS) # Note: not used
+CXX_OBJS ?= $(CPP_OBJS) $(CC_OBJS)
 ASM_OBJS ?= $(patsubst %.S,%.o,$(ASM_SRCS))
 
 # Create targets for individual object files
@@ -148,18 +184,17 @@ $(foreach OBJ,$(CPP_OBJS),$(eval $(call addTargetCxxObject,$(OBJ),cpp)))
 $(foreach OBJ,$(CC_OBJS),$(eval $(call addTargetCxxObject,$(OBJ),cc)))
 $(foreach OBJ,$(ASM_OBJS),$(eval $(call addTargetAsmObject,$(OBJ))))
 
-# Include dependency files discovered from already built object files.
-MCM_KNOWN_OBJECTS := $(sort $(C_OBJS) $(CPP_OBJS) $(CC_OBJS) $(ASM_OBJS))
-MCM_CACHE_DIRS := $(filter-out $(CACHE_ROOT)/generic/,$(wildcard $(CACHE_ROOT)/*/))
-MCM_CACHE_DIRS += $(wildcard $(CACHE_ROOT)/generic/*/)
-MCM_EXISTING_OBJECTS := $(foreach dir,$(MCM_CACHE_DIRS),$(wildcard $(addprefix $(dir),$(MCM_KNOWN_OBJECTS))))
-MCM_DEPFILES := $(patsubst %.o,%.d,$(MCM_EXISTING_OBJECTS))
+# Include the depfiles of objects built with the current global flags, so that header
+# changes trigger recompilation. Cache directories of other global flags are not read.
+MCM_DEPFILES := $(shell find $(MCM_CACHE_ROOT)/$(MCM_GLOBAL_DIR) -name '*.d' 2>/dev/null)
+# Empty rule: stops make searching implicit rules to remake each depfile (~100 failed stat() each).
+$(MCM_DEPFILES): ;
 include $(MCM_DEPFILES)
 
 # --------------------------------------------------------------------------------------------
 # The following macros are used to create targets in the user Makefile.
 # Binaries are built in the cache directory, and then symlinked to the current directory.
-# The cache directory is automatically derived from CACHE_ROOT and list of flags and compilers.
+# The cache directory is automatically derived from MCM_CACHE_ROOT and list of flags and compilers.
 
 
 # static_library - Create build rules for a static library with caching
@@ -176,15 +211,24 @@ define static_library  # libName, objectDeps, extraDeps, postBuildCmds, extraHas
 
 $$(if $$(filter 2,$$(V)),$$(info $$(call $(0),$(1),$(2),$(3),$(4),$(5))))
 MCM_ALL_BINS += $(1)
+MCM_OBJS_$(1) := $(2)
+MCM_XHASH_$(1) := $(5)
+MCM_LINK_KEY_$(1) = $$(AR) $$(ARFLAGS) $(MCM_STRIP)
 
-$$(CACHE_ROOT)/%/$(1) : $$(addprefix $$(CACHE_ROOT)/%/,$(2)) $(3)
+$$(MCM_CACHE_ROOT)/%/$(1) : $$$$(call mcm_link_objs,$$$$*,$(2)) $(3) | $$(MCM_CACHE_ROOT)/%/.
 	@echo AR $$@
+ifeq ($(MCM_LD_RESPONSE_FILE),1)
+	$$(file >$(1)_objects.rsp,$$(filter-out %.a,$$^))
+	$$(AR) $$(ARFLAGS) $$@ @$(1)_objects.rsp
+	$(RM) $(1)_objects.rsp
+else
 	$$(AR) $$(ARFLAGS) $$@ $$(filter-out %.a,$$^)
+endif
 	$(4)
 
 .PHONY: $(1)
 $(1) : ARFLAGS = rcs
-$(1) : $$(CACHE_ROOT)/$$(call HASH_FUNC,$(1),$(2) $$(CPPFLAGS) $$(CC) $$(CFLAGS) $$(CXX) $$(CXXFLAGS) $$(AR) $$(ARFLAGS) $(MCM_STRIP) $(5))/$(1)
+$(1) : $$$$(call mcm_cache_path,$(1))
 	$$(LN) -sf $$< $$@
 
 endef # static_library
@@ -204,10 +248,19 @@ define c_dynamic_library  # libName, objectDeps, extraDeps, postLinkCmds, extraH
 
 $$(if $$(filter 2,$$(V)),$$(info $$(call $(0),$(1),$(2),$(3),$(4),$(5))))
 MCM_ALL_BINS += $(1)
+MCM_OBJS_$(1) := $(2)
+MCM_XHASH_$(1) := $(5)
+MCM_LINK_KEY_$(1) = $$(LDFLAGS) $$(LDLIBS) $(MCM_STRIP)
 
-$$(CACHE_ROOT)/%/$(1) : $$(addprefix $$(CACHE_ROOT)/%/,$(2)) $(3)
+$$(MCM_CACHE_ROOT)/%/$(1) : $$$$(call mcm_link_objs,$$$$*,$(2)) $(3) | $$(MCM_CACHE_ROOT)/%/.
 	@echo LD $$@
+ifeq ($(MCM_LD_RESPONSE_FILE),1)
+	$$(file >$(1)_objects.rsp,$$^)
+	$$(CC) $$(CPPFLAGS) $$(CFLAGS) $$(LDFLAGS) -shared -o $$@ @$(1)_objects.rsp $$(LDLIBS)
+	$(RM) $(1)_objects.rsp
+else
 	$$(CC) $$(CPPFLAGS) $$(CFLAGS) $$(LDFLAGS) -shared -o $$@ $$^ $$(LDLIBS)
+endif
 ifeq ($(MCM_STRIP),1)
 	-$(STRIP) -S $$@
 endif
@@ -215,7 +268,7 @@ endif
 
 .PHONY: $(1)
 $(1) : CFLAGS += -fPIC
-$(1) : $$(CACHE_ROOT)/$$(call HASH_FUNC,$(1),$(2) $$(CPPFLAGS) $$(CC) $$(CFLAGS) $$(LDFLAGS) $$(LDLIBS) $(MCM_STRIP) $(5))/$(1)
+$(1) : $$$$(call mcm_cache_path,$(1))
 	$$(LN) -sf $$< $$@
 
 endef # c_dynamic_library
@@ -239,12 +292,15 @@ define program_base  # progName, objectDeps, extraDeps, postLinkCmds, extraHash,
 
 $$(if $$(filter 2,$$(V)),$$(info $$(call $(0),$(1),$(2),$(3),$(4),$(5),$(6),$(7))))
 MCM_ALL_BINS += $(1)
+MCM_OBJS_$(1) := $(2)
+MCM_XHASH_$(1) := $(5)
+MCM_LINK_KEY_$(1) = $$(LDFLAGS) $$(LDLIBS) $$(MCM_STRIP)
 
 ifeq ($(MCM_LD_RESPONSE_FILE),1)
 # Use response files when command line length limit is too small to fit the list of object files
 # Note: requires GNU make 4.0 or later
 
-$$(CACHE_ROOT)/%/$(1) : $$(addprefix $$(CACHE_ROOT)/%/,$(2)) $(3)
+$$(MCM_CACHE_ROOT)/%/$(1) : $$$$(call mcm_link_objs,$$$$*,$(2)) $(3) | $$(MCM_CACHE_ROOT)/%/.
 	@echo LD $$@
 	$$(file >$(1)_objects.rsp,$$^)
 	$$($(6)) $$(CPPFLAGS) $$($(7)) @$(1)_objects.rsp -o $$@ $$(LDFLAGS) $$(LDLIBS)
@@ -257,7 +313,7 @@ endif
 else
 
 # for normal cases: use direct listing of object files
-$$(CACHE_ROOT)/%/$(1) : $$(addprefix $$(CACHE_ROOT)/%/,$(2)) $(3)
+$$(MCM_CACHE_ROOT)/%/$(1) : $$$$(call mcm_link_objs,$$$$*,$(2)) $(3) | $$(MCM_CACHE_ROOT)/%/.
 	@echo LD $$@
 	$$($(6)) $$(CPPFLAGS) $$($(7)) $$^ -o $$@ $$(LDFLAGS) $$(LDLIBS)
 ifeq ($(MCM_STRIP),1)
@@ -267,17 +323,15 @@ endif
 
 endif
 
-MCM_HASH_$(1) = $$(call HASH_FUNC,$(1),$($(6)) $$(CPPFLAGS) $($(7)) $$(LDFLAGS) $$(LDLIBS) $$(MCM_STRIP) $(5))
-
 .PHONY: $(1)
-$(1) : $$(CACHE_ROOT)/$$(MCM_HASH_$(1))/$(1)
+$(1) : $$$$(call mcm_cache_path,$(1))
 	$$(LN) -sf $$< $$@$(EXE)
 
 endef # program_base
 # Note: $(EXE) must be set to .exe for Windows
 
 define c_program  # progName, objectDeps, extraDeps, postLinkCmds
-$$(eval $$(call program_base,$(1),$(2),$(3),$(4),$(1)$(2),CC,CFLAGS))
+$$(eval $$(call program_base,$(1),$(2),$(3),$(4),,CC,CFLAGS))
 endef # c_program
 
 define c_program_shared_o  # progName, objectDeps, extraDeps, postLinkCmds
@@ -285,7 +339,7 @@ $$(eval $$(call program_base,$(1),$(2),$(3),$(4),,CC,CFLAGS))
 endef # c_program_shared_o
 
 define cxx_program  # progName, objectDeps, extraDeps, postLinkCmds
-$$(eval $$(call program_base,$(1),$(2),$(3),$(4),$(1)$(2),CXX,CXXFLAGS))
+$$(eval $$(call program_base,$(1),$(2),$(3),$(4),,CXX,CXXFLAGS))
 endef # cxx_program
 
 define cxx_program_shared_o  # progName, objectDeps, extraDeps, postLinkCmds
@@ -294,10 +348,12 @@ endef # cxx_program_shared_o
 
 # --------------------------------------------------------------------------------------------
 
-# Cleaning: delete all objects and binaries created by this script
+# Cleaning: delete all objects and binaries created by this script, the parent directory
+# of MCM_CACHE_ROOT if left empty, and cachedObjs/, the default cache directory of earlier versions
 .PHONY: clean_cache
 clean_cache:
-	$(RM) -rf $(CACHE_ROOT)
+	$(RM) -rf $(MCM_CACHE_ROOT) cachedObjs
+	rmdir $(dir $(MCM_CACHE_ROOT)) 2>/dev/null || true
 	$(RM) $(MCM_ALL_BINS)
 	$(RM) *.rsp
 

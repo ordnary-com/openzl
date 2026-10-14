@@ -12,6 +12,25 @@ const zl = await createOpenZL()
 TypeScript projects use the accompanying `js/wasm_api.d.ts` declarations; the
 runtime wrapper remains plain JavaScript and requires no TypeScript build step.
 
+`getSerializedCompressor(profile, compressionLevel?)` accepts an optional
+compression level from 1 to 9. Omit it to use OpenZL's current default.
+
+Progress is scoped to calls made by this module instance:
+
+```js
+const zl = await createOpenZL({
+  onTrainingProgress(progress, message) {
+    console.log(`Training ${Math.round(progress * 100)}%: ${message}`)
+  },
+  onBenchmarkProgress(progress, message) {
+    console.log(`Benchmarking ${Math.round(progress * 100)}%: ${message}`)
+  },
+})
+```
+
+Browser applications should create the module in a Web Worker and forward
+these events to the UI with `postMessage`, since `train()` is synchronous.
+
 ### 1. Serial profile – arbitrary bytes
 
 Best for blobs, text, JSON, etc. No element-width assumption.
@@ -21,6 +40,7 @@ Best for blobs, text, JSON, etc. No element-width assumption.
 const fileBytes = new TextEncoder().encode("hello world, hello world, ...")
 
 // This is session-scoped and version-locked — re-fetch on page load, don't persist.
+// Omit the optional compression level to use OpenZL’s default
 const serialCompressor = zl.getSerializedCompressor(Profile.SERIAL)
 const compressed = zl.compress(fileBytes, serialCompressor)
 const decompressed = zl.decompress(compressed)
@@ -42,6 +62,7 @@ values.forEach((v, i) => view.setUint32(i * 4, v, /* littleEndian */ true))
 
 // Other widths: U16 -> 2 bytes + setUint16, I32 -> setInt32, U64 -> setBigUint64, etc.
 // The Profile you pick must match the width/encoding you used.
+// Omit the optional compression level to use OpenZL’s default
 const u32Compressor = zl.getSerializedCompressor(Profile.U32)
 const compressed = zl.compress(u32LEBytes, u32Compressor)
 const decompressedBytes = zl.decompress(compressed)
@@ -82,6 +103,7 @@ const roundtripped = Array.from({ length: decompressedBytes.length / 4 },
 // }
 
 const data = new TextEncoder().encode("some repeated data...".repeat(1000))
+// Omit the optional compression level to use OpenZL’s default
 const compressor = zl.getSerializedCompressor(Profile.SERIAL)
 
 console.log(`maximum benchmark iterations: ${zl.maxBenchmarkIterations}`)
@@ -137,7 +159,10 @@ source emsdk/emsdk_env.sh
 ### WASM artifact
 
 ```bash
-emcmake cmake -DOPENZL_BUILD_WASM=ON -B build-wasm
+emcmake cmake \
+  -DOPENZL_BUILD_WASM=ON \
+  -DCMAKE_BUILD_TYPE=MinSizeRel \
+  -B build-wasm
 cmake --build build-wasm --target openzl_wasm --parallel
 ```
 
@@ -153,6 +178,18 @@ memory declaration contains `i64`, for example `(memory $0 i64 512 32768)`.
 Node.js 24 supports Memory64 by default. Do not pass
 `--experimental-wasm-memory64` or `--experimental-wasm-table64`. Node 24
 rejects those obsolete flags.
+
+The build also applies `-pthread`, because the compressor trainers fan work out
+over a thread pool. Two consequences:
+
+* **Browsers must serve the page cross-origin isolated.** Threads need
+  `SharedArrayBuffer`, which requires `Cross-Origin-Opener-Policy: same-origin`
+  and `Cross-Origin-Embedder-Policy: require-corp` response headers. Without
+  them the module fails to instantiate. Node needs no equivalent setup.
+* **`-sPTHREAD_POOL_SIZE` bounds the trainers.** Emscripten pre-spawns four
+  workers by default. Training uses that pool unless an explicit `threads`
+  option requests fewer workers. To change the compiled capacity, configure
+  with `-DOPENZL_WASM_PTHREAD_POOL_SIZE=N`.
 
 ### Test
 

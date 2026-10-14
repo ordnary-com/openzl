@@ -6,8 +6,6 @@
 
 #include "openzl/common/allocation.h"
 #include "openzl/common/materializer_ctx.h" // struct ZL_Materializer_s
-#include "openzl/dict/bundle.h"
-#include "openzl/dict/dict.h"
 #include "openzl/dict/dict_constants.h"
 #include "openzl/shared/xxhash.h"
 #include "openzl/zl_errors.h"
@@ -139,6 +137,15 @@ void CDictMgr_destroy(CDictMgr* mgr)
         ALLOC_Arena_freeArena(mgr->arena);
     }
     memset(mgr, 0, sizeof(*mgr));
+}
+
+size_t CDictMgr_sizeof(const CDictMgr* mgr)
+{
+    if (mgr == NULL) {
+        return 0;
+    }
+    return ALLOC_Arena_memAllocated(mgr->arena)
+            + ALLOC_Arena_memAllocated(mgr->scratchArena);
 }
 
 /* ================================================================

@@ -1,7 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+import csv
+import ntpath
 import os
 import shutil
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -128,6 +132,70 @@ class BenchmarkCsvCompressionTest(_BenchmarkBaseTest):
 
     def test_benchmark(self):
         self.benchmark()
+
+
+class BenchmarkOutputCsvTest(unittest.TestCase):
+    """Test the per-input rows written by benchmark --output-csv."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmpdir, True))
+        self.input_dir = os.path.join(self.tmpdir, "input")
+        os.makedirs(self.input_dir)
+
+    def _write_input(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.input_dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def _benchmark_rows(self, input_path: str) -> list[dict[str, str]]:
+        csv_path = os.path.join(self.tmpdir, "benchmark.csv")
+        subprocess.run(
+            [
+                command_utils.CLI_CPP,
+                "benchmark",
+                input_path,
+                "--profile",
+                "serial",
+                "--num-iters",
+                "1",
+                "--output-csv",
+                csv_path,
+            ],
+            check=True,
+        )
+        with open(csv_path, newline="") as f:
+            return list(csv.DictReader(f))
+
+    def test_each_row_reports_its_own_ratio_and_path(self):
+        self._write_input("zeros.bin", bytes(100_000))
+        self._write_input("noise.bin", os.urandom(100_000))
+
+        rows = self._benchmark_rows(self.input_dir)
+
+        # A native Windows zli reports Windows paths, which may mix "/" and "\\".
+        self.assertCountEqual(
+            [ntpath.basename(row["path"]) for row in rows],
+            ["zeros.bin", "noise.bin"],
+        )
+        for row in rows:
+            self.assertAlmostEqual(
+                float(row["compressionRatio"]),
+                int(row["srcSize"]) / int(row["compressedSize"]),
+                delta=float(row["compressionRatio"]) * 1e-5,
+            )
+
+    @unittest.skipIf(
+        sys.platform in ("win32", "cygwin", "msys"),
+        'Windows filenames cannot contain "',
+    )
+    def test_path_with_separator_and_quote_round_trips(self):
+        path = self._write_input('a,"b".bin', bytes(1000))
+
+        rows = self._benchmark_rows(path)
+
+        self.assertEqual([row["path"] for row in rows], [path])
 
 
 class TraceTest(_CompressDecompressBaseTest):
@@ -307,10 +375,6 @@ class NumericSegmentationTest(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        import shutil
-        import struct
-        import tempfile
-
         self.tmpdir = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(self.tmpdir, True))
 
@@ -319,30 +383,46 @@ class NumericSegmentationTest(unittest.TestCase):
         self.test_files: dict[str, dict] = {}
         target_bytes = 2 * 1000 * 1000  # 2 MB
         configs = [
-            ("u8", "B", 1, "u8"),
-            ("le-u16", "H", 2, "le-u16"),
-            ("le-i32", "i", 4, "le-i32"),
-            ("le-u64", "Q", 8, "le-u64"),
+            ("u8", "<", "B", 1),
+            ("le-u16", "<", "H", 2),
+            ("le-i32", "<", "i", 4),
+            ("le-u32", "<", "I", 4),
+            ("le-u64", "<", "Q", 8),
+            ("be-u16", ">", "H", 2),
+            ("be-i16", ">", "h", 2),
+            ("be-u32", ">", "I", 4),
+            ("be-i32", ">", "i", 4),
+            ("be-u64", ">", "Q", 8),
+            ("be-i64", ">", "q", 8),
         ]
-        for profile, fmt, elt_size, name in configs:
+        for profile, endian, fmt, elt_size in configs:
             n = target_bytes // elt_size
-            max_val = 2 ** (elt_size * 8)
-            data = struct.pack(f"<{n}{fmt}", *[i % max_val for i in range(n)])
-            path = os.path.join(self.tmpdir, f"{name}.bin")
+            if fmt.islower():
+                max_val = 2 ** (elt_size * 8 - 1)
+                values = [(i % max_val) - max_val // 2 for i in range(n)]
+            else:
+                max_val = 2 ** (elt_size * 8)
+                values = [i % max_val for i in range(n)]
+            data = struct.pack(f"{endian}{n}{fmt}", *values)
+            path = os.path.join(self.tmpdir, f"{profile}.bin")
             with open(path, "wb") as f:
                 f.write(data)
-            self.test_files[name] = {
+            self.test_files[profile] = {
                 "path": path,
                 "profile": profile,
                 "size": len(data),
             }
 
     def _round_trip(
-        self, profile: str, input_path: str, extra_args: str | None = None
-    ) -> None:
+        self,
+        profile: str,
+        input_path: str,
+        extra_args: str | None = None,
+        output_suffix: str = "",
+    ) -> str:
         """Compress, decompress, and verify round-trip for a single file."""
-        compressed_path = input_path + ".zl"
-        decompressed_path = input_path + ".rt"
+        compressed_path = input_path + output_suffix + ".zl"
+        decompressed_path = input_path + output_suffix + ".rt"
 
         compressor_info = CompressorInfo(
             compressor_str=profile,
@@ -358,18 +438,57 @@ class NumericSegmentationTest(unittest.TestCase):
             compressed_file_path=compressed_path,
             decompressed_file_path=decompressed_path,
         )
-        from file_utils import file_contents_match
-
         self.assertTrue(
             file_contents_match(input_path, decompressed_path),
             f"Round-trip failed for profile {profile} on {input_path}",
         )
+        return compressed_path
 
     def test_numeric_profiles_roundtrip(self) -> None:
         """Test that all numeric profiles compress and decompress correctly."""
         for name, info in self.test_files.items():
             with self.subTest(profile=name):
                 self._round_trip(info["profile"], info["path"])
+
+    def test_numeric_profiles_compress_at_level_7(self) -> None:
+        """Test that level 7 applies useful numeric compression."""
+        for profile in ("le-u32", "be-u32"):
+            info = self.test_files[profile]
+            with self.subTest(profile=profile):
+                compressed_path = self._round_trip(
+                    info["profile"],
+                    info["path"],
+                    extra_args="--level 7",
+                    output_suffix=".level7",
+                )
+                self.assertLess(
+                    os.path.getsize(compressed_path),
+                    info["size"],
+                    f"{profile} stored rather than compressed the numeric input",
+                )
+
+    def test_equivalent_endianness_has_matching_compressed_size(self) -> None:
+        """Test equivalent LE and BE inputs produce equal compressed sizes."""
+        level7_outputs: dict[str, str] = {}
+        for profile in ("le-u32", "be-u32"):
+            info = self.test_files[profile]
+            with self.subTest(profile=profile):
+                compressed_path = self._round_trip(
+                    info["profile"],
+                    info["path"],
+                    extra_args="--level 7",
+                    output_suffix=".level7.parity",
+                )
+                level7_outputs[profile] = compressed_path
+
+        # This compares whole-frame sizes and therefore relies on the current
+        # format using equal-sized encodings for the LE and BE interpretation
+        # nodes. Compare payload sizes instead if a stable API exposes them.
+        self.assertEqual(
+            os.path.getsize(level7_outputs["le-u32"]),
+            os.path.getsize(level7_outputs["be-u32"]),
+            "Equivalent little- and big-endian inputs compressed differently",
+        )
 
     def test_numeric_profiles_with_chunk_size(self) -> None:
         """Test numeric profiles with --chunk-size 1M on 2MB data (forces 2 chunks)."""
@@ -380,6 +499,119 @@ class NumericSegmentationTest(unittest.TestCase):
                     info["path"],
                     extra_args="--chunk-size 1M",
                 )
+
+
+class CompressionLevelTest(unittest.TestCase):
+    """Test explicit compression levels in the compress command."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmpdir, True))
+
+        values = list(range(16384)) * 4
+        self.input_path = os.path.join(self.tmpdir, "u32.bin")
+        with open(self.input_path, "wb") as f:
+            f.write(struct.pack(f"<{len(values)}I", *values))
+
+    def _compress_and_round_trip(
+        self,
+        profile: str,
+        level: int,
+        extra_args: str = "",
+        output_suffix: str = "",
+        input_path: str | None = None,
+    ) -> str:
+        source_path = input_path or self.input_path
+        compressed_path = os.path.join(
+            self.tmpdir, f"{profile}-level-{level}{output_suffix}.zl"
+        )
+        decompressed_path = compressed_path + ".rt"
+        execute_compress(
+            file_to_compress_path=source_path,
+            compressor_info=CompressorInfo(
+                compressor_str=profile,
+                compressor_type=CompressorType.PROFILE,
+            ),
+            compressed_file_path=compressed_path,
+            extra_args=f"--level {level} {extra_args}",
+        )
+        execute_decompress(
+            compressed_file_path=compressed_path,
+            decompressed_file_path=decompressed_path,
+        )
+        self.assertTrue(file_contents_match(source_path, decompressed_path))
+        return compressed_path
+
+    def test_compression_level(self) -> None:
+        zstd_level_1 = self._compress_and_round_trip("zstd", 1)
+        zstd_level_19 = self._compress_and_round_trip("zstd", 19)
+        with open(zstd_level_1, "rb") as level_1_file:
+            with open(zstd_level_19, "rb") as level_19_file:
+                self.assertNotEqual(level_1_file.read(), level_19_file.read())
+
+        numeric_level_7 = self._compress_and_round_trip("le-u32", 7)
+        numeric_level_7_trained = self._compress_and_round_trip(
+            "le-u32",
+            7,
+            "--train-inline --train-inline-test-limit 1",
+            "-train-inline",
+        )
+        self.assertLessEqual(
+            os.path.getsize(numeric_level_7_trained),
+            os.path.getsize(numeric_level_7),
+        )
+
+        invalid_output = os.path.join(self.tmpdir, "invalid-level.zl")
+        self.assertNotEqual(
+            command_utils.execute_command(
+                f"compress {self.input_path} --profile le-u32 "
+                f"--level invalid -o {invalid_output}"
+            ),
+            0,
+        )
+
+    def _write_sao_file(self) -> str:
+        sao_path = os.path.join(self.tmpdir, "sao.bin")
+        with open(sao_path, "wb") as sao_file:
+            sao_file.write(bytes(28))
+            for i in range(16384):
+                sao_file.write(
+                    struct.pack(
+                        "<dd2shff",
+                        i / 8192.0,
+                        (i % 4096) / 2048.0 - 1.0,
+                        (b"G2", b"K1", b"M0")[i % 3],
+                        (i % 3000) - 1500,
+                        (i % 1024) / 1024.0,
+                        -((i % 2048) / 2048.0),
+                    )
+                )
+        return sao_path
+
+    @staticmethod
+    def _trace_uses_transformer(trace_path: str) -> bool:
+        with open(trace_path, "rb") as trace_file:
+            # CBOR text strings retain their UTF-8 representation in the trace.
+            return b"zl.private.transformer_" in trace_file.read()
+
+    def test_sao_compression_level(self) -> None:
+        sao_path = self._write_sao_file()
+        level_6_trace = os.path.join(self.tmpdir, "sao-level-6.trace")
+        level_7_trace = os.path.join(self.tmpdir, "sao-level-7.trace")
+        self._compress_and_round_trip(
+            "sao",
+            6,
+            extra_args=f"--trace {level_6_trace} --no-stream-preview",
+            input_path=sao_path,
+        )
+        self._compress_and_round_trip(
+            "sao",
+            7,
+            extra_args=f"--trace {level_7_trace} --no-stream-preview",
+            input_path=sao_path,
+        )
+        self.assertFalse(self._trace_uses_transformer(level_6_trace))
+        self.assertTrue(self._trace_uses_transformer(level_7_trace))
 
 
 class SerialSegmentationTest(unittest.TestCase):

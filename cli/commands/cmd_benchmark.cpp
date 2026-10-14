@@ -6,6 +6,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 
 #include "openzl/cpp/CCtx.hpp"
 #include "openzl/cpp/DCtx.hpp"
@@ -24,6 +25,15 @@ using namespace openzl::tools::logger;
 namespace {
 constexpr size_t BYTES_TO_MB = 1000 * 1000;
 
+/// @return @p uncompressed_size / @p compressed_size, or 0 when nothing was
+/// compressed, so the CSV never contains inf or nan.
+double compressionRatio(size_t uncompressed_size, size_t compressed_size)
+{
+    return compressed_size == 0
+            ? 0.0
+            : static_cast<double>(uncompressed_size) / compressed_size;
+}
+
 /// Updates the printed line of benchmarks based on the new parameters provided.
 /// @return The BenchmarkResult structure containing ratio and speeds
 BenchmarkResult updateResults(
@@ -34,7 +44,7 @@ BenchmarkResult updateResults(
         std::chrono::nanoseconds cdur,
         std::chrono::nanoseconds ddur)
 {
-    const auto ratio = static_cast<double>(uncompressed_size) / compressed_size;
+    const auto ratio = compressionRatio(uncompressed_size, compressed_size);
 
     const auto cmicros = std::chrono::duration<double, std::micro>(cdur);
     const auto dmicros = std::chrono::duration<double, std::micro>(ddur);
@@ -61,19 +71,40 @@ BenchmarkResult updateResults(
     };
 }
 
+/// Writes @p field as a CSV field, quoting it when it contains a separator,
+/// quote or line break.
+void writeCsvField(std::ostream& out, std::string_view field)
+{
+    if (field.find_first_of(",\"\r\n") == std::string_view::npos) {
+        out << field;
+        return;
+    }
+    out << '"';
+    for (const char c : field) {
+        if (c == '"') {
+            out << '"';
+        }
+        out << c;
+    }
+    out << '"';
+}
+
 /**
  * Helper function to create a compression context with the given compressor and
  * level.
  */
 CCtx createCompressionContext(
         const Compressor& compressor,
+        int formatVersion,
         const std::optional<int>& level,
         bool strict)
 {
     // create compression context
     CCtx cctx;
 
-    cctx.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+    // CCtx parameters take precedence over the Compressor's, so the requested
+    // format version has to be mirrored here to take effect.
+    cctx.setParameter(CParam::FormatVersion, formatVersion);
     cctx.setParameter(CParam::StickyParameters, 1);
     if (!strict) {
         cctx.setParameter(CParam::PermissiveCompression, 1);
@@ -100,11 +131,11 @@ BenchmarkResult runCompressionBenchmarks(const BenchmarkArgs& args)
 
     // create compressor, context, and decompression context
     auto cctx = createCompressionContext(
-            *args.compressor(), args.level, args.strict);
+            *args.compressor(), args.formatVersion, args.level, args.strict);
+    std::optional<FatBundleDictLoader> fatBundleLoader;
     DCtx dctx;
 
     // Load dict bundle into DCtx if available
-    std::optional<FatBundleDictLoader> fatBundleLoader;
     if (!args.dictBundleData.empty()) {
         fatBundleLoader.emplace();
         fatBundleLoader->loadFatBundle(args.dictBundleData);
@@ -176,7 +207,7 @@ BenchmarkResult runCompressionBenchmarks(const BenchmarkArgs& args)
                 cdur,
                 ddur);
         csvOut << uncompressed_size << "," << compressed.size() << ","
-               << finalResult.compressionRatio << ","
+               << compressionRatio(uncompressed_size, compressed.size()) << ","
                << std::chrono::duration<double, std::milli>(
                           compression_end - compression_start)
                           .count()
@@ -184,7 +215,11 @@ BenchmarkResult runCompressionBenchmarks(const BenchmarkArgs& args)
                << std::chrono::duration<double, std::milli>(
                           decompression_end - decompression_start)
                           .count()
-               << "," << iters << std::endl;
+               << "," << iters << ",";
+        // The command line builds one input source per row.
+        const auto& sources = inputs.inputSources();
+        writeCsvField(csvOut, sources.size() == 1 ? sources[0]->name() : "");
+        csvOut << std::endl;
     }
     // Finish the benchmark line.
     Logger::finalizeUpdate(INFO);

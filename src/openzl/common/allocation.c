@@ -133,6 +133,29 @@ size_t ALLOC_Arena_memUsed(const Arena* arena)
     return arena->memUsed(arena);
 }
 
+#define ALLOC_ARENA_SIZE_MAX (1024ULL * 1024 * 1024) // 1 GiB
+
+static bool ALLOC_Arena_canAllocate(
+        const Arena* arena,
+        size_t releasedSize,
+        size_t requestedSize)
+{
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    size_t allocatedSize = ALLOC_Arena_memAllocated(arena);
+    if (releasedSize > allocatedSize) {
+        return false;
+    }
+    allocatedSize -= releasedSize;
+    return allocatedSize <= ALLOC_ARENA_SIZE_MAX
+            && requestedSize <= ALLOC_ARENA_SIZE_MAX - allocatedSize;
+#else
+    (void)arena;
+    (void)releasedSize;
+    (void)requestedSize;
+    return true;
+#endif
+}
+
 /*============================================================================
  * RawAllocator: For internal allocator use for allocs that MUST NOT be part
  * of the allocation failure injection mechanism.
@@ -227,6 +250,9 @@ static void* ALLOC_HeapArena_malloc(Arena* arena, size_t size)
     if (ZL_overflowAddST(size, sizeof(HeapMeta), &allocSize)) {
         return NULL;
     }
+    if (!ALLOC_Arena_canAllocate(arena, 0, size)) {
+        return NULL;
+    }
     void* const ptr = ZL_malloc(allocSize);
     return ALLOC_HeapArena_allocImpl(heapArena, ptr, size);
 }
@@ -237,6 +263,9 @@ static void* ALLOC_HeapArena_calloc(Arena* arena, size_t size)
     HeapArena* heapArena = ZL_CONTAINER_OF(arena, HeapArena, base);
     size_t allocSize;
     if (ZL_overflowAddST(size, sizeof(HeapMeta), &allocSize)) {
+        return NULL;
+    }
+    if (!ALLOC_Arena_canAllocate(arena, 0, size)) {
         return NULL;
     }
     void* const ptr = ZL_calloc(allocSize);
@@ -253,6 +282,9 @@ static void* ALLOC_HeapArena_realloc(Arena* arena, void* ptr, size_t newSize)
     HeapMeta* const oldMeta = (HeapMeta*)ptr - 1;
     size_t allocSize;
     if (ZL_overflowAddST(newSize, sizeof(HeapMeta), &allocSize)) {
+        return NULL;
+    }
+    if (!ALLOC_Arena_canAllocate(arena, oldMeta->size, newSize)) {
         return NULL;
     }
     HeapMeta* const newMeta = ZL_realloc(oldMeta, allocSize);
@@ -485,8 +517,10 @@ struct StackArena_s {
     void* primaryBuffer;
     size_t pBuffCapacity;
     size_t pBuffUsed;
-    size_t wouldHaveNeeded; // Tracks amount of memory allocated outside of
-                            // @primaryBuffer
+    size_t wouldHaveNeeded; // Amount allocated outside of @primaryBuffer
+                            // during the current session, i.e. how much larger
+                            // @primaryBuffer should have been. Reset when the
+                            // next session sizes the buffer from it.
     size_t sessionUsage;    // Tracks amount of memory requested from this arena
                             // before a reset
     size_t wasted;          // pBuffCapacity * nbTimesUsedWastefully,
@@ -522,9 +556,11 @@ static void* ALLOC_StackArena_malloc(Arena* arena, size_t requestSize)
     size_t const neededSize       = size + (alignment - 1);
     pba->sessionUsage += neededSize;
 
-    if ((pba->pBuffUsed == 0) /* first request in session */
-        && ((pBuffAvailable < neededSize) /* insufficient capacity for first request */
-            || (pBuffAvailable < pba->wouldHaveNeeded) /* insufficient capacity for previous session */)) {
+    /* On the first request of a session, resize the primary buffer if it is
+     * too small to serve that request, or if the previous session had to
+     * spill into the heap backup. */
+    if ((pba->pBuffUsed == 0)
+        && ((pBuffAvailable < neededSize) || (pba->wouldHaveNeeded > 0))) {
         /* let's resize the primary buffer, which is too small */
         ZL_free(pba->primaryBuffer);
         // We are going to reuse primaryBuffer for all future allocation in this
@@ -534,21 +570,32 @@ static void* ALLOC_StackArena_malloc(Arena* arena, size_t requestSize)
         static const size_t pBuffSizeMin =
                 4080; // could become a compilation constant in the future
         static const size_t pBuffSizeMax = ALLOC_STACK_SIZE_MAX;
+        /* The previous session needed its whole buffer plus whatever spilled
+         * to the backup. Consuming @wouldHaveNeeded here, rather than carrying
+         * it forward, is what lets the buffer shrink again: a session that did
+         * not spill leaves it at 0, so the next one keeps (or sizes down) the
+         * current buffer instead of re-growing to a stale high-water mark. */
+        size_t const prevSessionNeed =
+                pba->pBuffCapacity + pba->wouldHaveNeeded;
         size_t const toAllocate =
-                ZL_MAX(ZL_MAX(pba->wouldHaveNeeded, neededSize), pBuffSizeMin);
+                ZL_MAX(ZL_MAX(prevSessionNeed, neededSize), pBuffSizeMin);
+        pba->wouldHaveNeeded = 0;
         if (toAllocate <= pBuffSizeMax) {
-            pba->primaryBuffer = ZL_malloc(toAllocate);
+            if (ALLOC_Arena_canAllocate(
+                        arena, pba->pBuffCapacity, toAllocate)) {
+                pba->primaryBuffer = ZL_malloc(toAllocate);
+            } else {
+                pba->primaryBuffer = NULL;
+            }
         } else {
             /* request too large : do not allocate primaryBuffer
              * request will be taken care of by HeapArena backup */
-            pba->primaryBuffer   = NULL;
-            pba->wouldHaveNeeded = ZL_MIN(pba->wouldHaveNeeded, pBuffSizeMax);
+            pba->primaryBuffer = NULL;
         }
         if (pba->primaryBuffer) {
             ZL_poisonMemory(pba->primaryBuffer, toAllocate);
-            pba->pBuffCapacity   = toAllocate;
-            pba->pBuffUsed       = neededSize;
-            pba->wouldHaveNeeded = toAllocate;
+            pba->pBuffCapacity = toAllocate;
+            pba->pBuffUsed     = neededSize;
             ZL_ASSERT_EQ(
                     (size_t)pba->primaryBuffer % alignment,
                     0); /* note : this alignment method will have to change if
@@ -558,10 +605,9 @@ static void* ALLOC_StackArena_malloc(Arena* arena, size_t requestSize)
             return pba->primaryBuffer;
         }
         /* allocation failed */
-        pba->pBuffCapacity   = 0;
-        pba->pBuffUsed       = 0;
-        pBuffAvailable       = 0;
-        pba->wouldHaveNeeded = 0;
+        pba->pBuffCapacity = 0;
+        pba->pBuffUsed     = 0;
+        pBuffAvailable     = 0;
     }
 
     /* second+ request, or allocation of primary buffer failed */
@@ -586,7 +632,9 @@ static void* ALLOC_StackArena_malloc(Arena* arena, size_t requestSize)
     /* not enough space in primaryBuffer :
      * assign backup heap memory for this session
      * and track necessary space, for next session */
-    ZL_ASSERT_GE(pba->wouldHaveNeeded, pba->pBuffCapacity);
+    if (!ALLOC_Arena_canAllocate(arena, 0, requestSize)) {
+        return NULL;
+    }
     pba->wouldHaveNeeded += neededSize;
     return ALLOC_Arena_malloc(&pba->heapBackup.base, requestSize);
 }
@@ -623,6 +671,9 @@ static void* ALLOC_StackArena_realloc(Arena* arena, void* ptr, size_t newSize)
         // supported freeing the most recently allocated pointer.
         //
         // For now, we always copy into the heap arena.
+        if (!ALLOC_Arena_canAllocate(arena, 0, newSize)) {
+            return NULL;
+        }
         void* newPtr = ALLOC_Arena_malloc(&pba->heapBackup.base, newSize);
         if (newPtr == NULL) {
             return NULL;
@@ -642,6 +693,10 @@ static void* ALLOC_StackArena_realloc(Arena* arena, void* ptr, size_t newSize)
         ALLOC_StackArena_trackFree(pba, ptr);
         return newPtr;
     } else {
+        const size_t oldSize = ptr == NULL ? 0 : ((HeapMeta*)ptr - 1)->size;
+        if (!ALLOC_Arena_canAllocate(arena, oldSize, newSize)) {
+            return NULL;
+        }
         return ALLOC_HeapArena_realloc(&pba->heapBackup.base, ptr, newSize);
     }
 }

@@ -272,6 +272,7 @@ static ZL_Report DFH_decodeOutputSizes(
             dSizes, numElts, src, cSize, types, nbOutputs);
 }
 
+/// @note Make sure that zfi is freed & cleared on failure
 static ZL_Report DFH_FrameInfo_decodeFrameHeader(
         ZL_FrameInfo* zfi,
         const void* cSrc,
@@ -434,6 +435,15 @@ void ZL_FrameInfo_free(ZL_FrameInfo* zfi)
     ZL_free(zfi);
 }
 
+static size_t ZL_FrameInfo_sizeof(const ZL_FrameInfo* zfi)
+{
+    if (zfi == NULL)
+        return 0;
+    return sizeof(*zfi) + zfi->nbOutputs * sizeof(*zfi->types)
+            + zfi->nbOutputs * sizeof(*zfi->decompressedSizes)
+            + zfi->nbOutputs * sizeof(*zfi->numElts) + zfi->commentSize;
+}
+
 ZL_Report ZL_FrameInfo_getFormatVersion(const ZL_FrameInfo* zfi)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
@@ -493,7 +503,7 @@ ZL_Report ZL_FrameInfo_getNumElts(const ZL_FrameInfo* zfi, int outputID)
             zfi->formatVersion,
             ZL_CHUNK_VERSION_MIN,
             GENERIC,
-            "This method only works on frames with version >= %zu",
+            "This method only works on frames with version >= %d",
             ZL_CHUNK_VERSION_MIN);
 
     // Currently only supports string & serial
@@ -583,7 +593,7 @@ ZL_RESULT_OF(ZL_Comment) ZL_FrameInfo_getComment(const ZL_FrameInfo* zfi)
             zfi->formatVersion,
             ZL_COMMENT_VERSION_MIN,
             GENERIC,
-            "This method only works on frames with version >= %zu",
+            "This method only works on frames with version >= %d",
             ZL_COMMENT_VERSION_MIN);
     comment.data = zfi->comment;
     comment.size = zfi->commentSize;
@@ -666,6 +676,16 @@ void DFH_destroy(DFH_Struct* dfh)
     VECTOR_DESTROY(dfh->regenDistances);
     ZL_FrameInfo_free(dfh->frameinfo);
     dfh->frameinfo = NULL;
+}
+
+size_t DFH_sizeof(const DFH_Struct* dfh)
+{
+    if (dfh == NULL) {
+        return 0;
+    }
+    return VECTOR_SIZEOF(dfh->storedStreamSizes)
+            + VECTOR_SIZEOF(dfh->regenDistances) + VECTOR_SIZEOF(dfh->nodes)
+            + ZL_FrameInfo_sizeof(dfh->frameinfo);
 }
 
 // Public Symbol
@@ -1127,7 +1147,13 @@ static ZL_Report DFH_decodeFrameHeader_V3orMore(
         ZL_FrameInfo_free(dfh->frameinfo);
     dfh->frameinfo = ZL_malloc(sizeof(*(dfh->frameinfo)));
     ZL_ERR_IF_NULL(dfh->frameinfo, allocation);
-    return DFH_FrameInfo_decodeFrameHeader(dfh->frameinfo, src, srcSize);
+    const ZL_Report report =
+            DFH_FrameInfo_decodeFrameHeader(dfh->frameinfo, src, srcSize);
+    if (ZL_isError(report)) {
+        ZL_FrameInfo_free(dfh->frameinfo);
+        dfh->frameinfo = NULL;
+    }
+    return report;
 }
 
 /* src is expected to start at beginning of chunk header */
@@ -1415,7 +1441,8 @@ static ZL_Report getDecompressedSizeV3orMore(
             oSize,
             (uint64_t)SIZE_MAX,
             GENERIC,
-            "large size (%llu): unsupported on current system");
+            "large size (%llu): unsupported on current system",
+            (unsigned long long)oSize);
     return ZL_returnValue((size_t)oSize - 1);
 }
 

@@ -195,6 +195,20 @@ void ZL_DCtx_free(ZL_DCtx* dctx)
     ZL_free(dctx);
 }
 
+size_t ZL_DCtx_sizeof(const ZL_DCtx* dctx)
+{
+    if (dctx == NULL) {
+        return 0;
+    }
+    return sizeof(*dctx) + DFH_sizeof(&dctx->dfh) + DTM_sizeof(&dctx->dtm)
+            + ZL_OC_sizeof(&dctx->opCtx)
+            + ALLOC_Arena_memAllocated(dctx->fusion.arena)
+            + ALLOC_Arena_memAllocated(dctx->decoderWkspArena)
+            + ALLOC_Arena_memAllocated(dctx->fusionWkspArena)
+            + ALLOC_Arena_memAllocated(dctx->streamArena)
+            + ALLOC_Arena_memAllocated(dctx->chunkArena);
+}
+
 ZL_Report DCTX_registerDecoderFusion(
         ZL_DCtx* dctx,
         const ZL_DecoderFusionDesc* fusion)
@@ -694,7 +708,7 @@ static ZL_Report DCTX_validateNodeStatic(
     ZL_ERR_IF_NOT(
             DT_isNbRegensCompatible(dt, nodeInfo->nbRegens),
             nodeRegen_countIncorrect,
-            "Transform '%s'(%u) is assigned %u streams to regenerate, but its signature specifies %u streams",
+            "Transform '%s'(%u) is assigned %u streams to regenerate, but its signature specifies %zu streams",
             DT_getTransformName(dt),
             nodeInfo->trpid.trid,
             nodeInfo->nbRegens,
@@ -710,7 +724,7 @@ static ZL_Report DCTX_validateNodeStatic(
                 0,
                 corruption,
                 "Transform id=%u isn't accepting VO streams, "
-                "but %zu VO streams are nonetheless assigned to it in this graph.",
+                "but %u VO streams are nonetheless assigned to it in this graph.",
                 dt->miGraphDesc.CTid,
                 nodeInfo->nbVOs);
     }
